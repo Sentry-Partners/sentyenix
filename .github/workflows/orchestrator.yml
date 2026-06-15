@@ -35,6 +35,11 @@ jobs:
           ISSUE_NUM=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
           echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
           
+      - name: Verify CLIs
+        run: |
+          which claude || echo "Claude CLI not available"
+          which codex || echo "Codex CLI not available"
+          
       - name: Run orchestrator for push
         if: github.event_name == 'push' && steps.create_issue.outputs.issue_number != ''
         env:

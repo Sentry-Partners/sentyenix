@@ -34,12 +34,20 @@ SENTYENIX_ROOT = Path.home() / ".kimi_openclaw" / "workspace" / "sentyenix"
 
 # Model families available for multi-lineage camps
 MODEL_FAMILIES = {
-    "claude": {"cli": "claude", "args": ["-a", "never", "exec", "--skip-git-repo-check", "-s", "read-only"]},
-    "codex": {"cli": "codex", "args": ["-a", "never", "exec", "--skip-git-repo-check", "-s", "read-only"]},
+    "claude": {
+        "cli": "claude",
+        "args": ["-p", "--permission-mode", "bypassPermissions", "--bare"],
+        "output_redirect": None,  # -p prints directly to stdout
+    },
+    "codex": {
+        "cli": "codex",
+        "args": ["-a", "never", "exec", "--skip-git-repo-check", "-s", "read-only"],
+        "output_redirect": None,
+    },
     # Grok and Kimi can be added when their CLIs are available
     # "grok": ...
     # "kimi": ...
-    # "gemma": {"cli": "ollama", "args": ["run", "gemma4:31b"]}
+    # "gemma": {"cli": "ollama", "args": ["run", "gemma4:31b"], "output_redirect": None}
 }
 
 # ── GitHub API ────────────────────────────────────────────────────────────────
@@ -271,9 +279,13 @@ Respond with a structured analysis including:
                 text=True,
                 timeout=timeout,
                 cwd=str(self.repo_root),
+                env={**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
             )
             if result.returncode != 0:
-                return f"[ERROR] {model} CLI failed: {result.stderr[:500]}"
+                err = result.stderr[:500]
+                if "Not logged in" in err or "login" in err.lower():
+                    return f"[ERROR] {model} CLI not authenticated: {err}"
+                return f"[ERROR] {model} CLI failed: {err}"
             return result.stdout
         except subprocess.TimeoutExpired:
             return f"[ERROR] {model} CLI timed out after {timeout}s"
