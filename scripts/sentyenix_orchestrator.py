@@ -280,7 +280,38 @@ class ConvergenceTracker:
         )
         return any(term in issue for term in critical_terms)
 
-# ── MAT Orchestrator ────────────────────────────────────────────────────────
+class CampProgressReporter:
+    """Writes live progress updates so humans can see the camp isn't stuck."""
+
+    def __init__(self, repo_root: Path, issue_number: int):
+        self.repo_root = repo_root
+        self.issue_number = issue_number
+        self.progress_file = repo_root / f".camp-progress-{issue_number}.json"
+        self.started = datetime.now(timezone.utc)
+
+    def update(self, status: str, step: str, detail: str = ""):
+        """Write current progress to JSON file."""
+        elapsed = (datetime.now(timezone.utc) - self.started).total_seconds()
+        data = {
+            "issue_number": self.issue_number,
+            "status": status,          # running | building | reviewing | assessing | done | error
+            "step": step,              # e.g. "Builder Round 2: codex"
+            "detail": detail,          # e.g. "Diff: 19839 chars"
+            "elapsed_seconds": int(elapsed),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self.progress_file.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass  # Don't let progress reporting break the camp
+
+    def done(self, result: str, rounds: int):
+        self.update("done", "Camp complete", f"{result} in {rounds} rounds")
+        # Clean up progress file
+        try:
+            self.progress_file.unlink()
+        except Exception:
+            pass
 
 class MATOrchestrator:
     def __init__(self, github: GitHubAPI, registry: AgentRegistry, repo_root: Path):
@@ -289,6 +320,7 @@ class MATOrchestrator:
         self.repo_root = repo_root
         self.runner = CLIRunner()
         self.tracker = ConvergenceTracker()
+        self.progress = None  # type: CampProgressReporter | None
 
     def check_model(self, model: str) -> bool:
         cli_info = MODEL_FAMILIES.get(model)
@@ -443,17 +475,34 @@ SCOPE_REVIEW:
         print(f"🏗️  MAT Camp — Issue #{number}: {issue.get('title', '')}")
         print(f"{'='*60}")
 
+        # Initialize progress reporter
+        self.progress = CampProgressReporter(self.repo_root, number)
+        self.progress.update("running", "Camp initializing", "Checking model availability")
+
+        # Post "camp started" comment so user can watch live
+        self.github.create_comment(
+            number,
+            f"🏕️ **MAT Camp started** — Builder/Quorum loop running\n"
+            f"- Models checking...\n"
+            f"- Live progress: watch this issue for round-by-round updates\n"
+            f"- Started: {datetime.now(timezone.utc).isoformat()}"
+        )
+
         # Check models
         available = {m: self.check_model(m) for m in MODEL_FAMILIES}
         print(f"\nModels: " + " ".join(f"{'✅' if v else '❌'} {k}" for k, v in available.items()))
 
         if not available.get("codex"):
             print("❌ No builder available")
+            self.progress.update("error", "No builder available", "Codex CLI not found or not authenticated")
+            self.github.create_comment(number, "❌ **Camp aborted:** Codex builder not available.")
             return
 
         quorum = [m for m in ["claude", "kimi"] if available.get(m)]
         if len(quorum) < 1:
             print("⚠️  No quorum — running builder once")
+
+        self.progress.update("running", f"Camp active | Quorum: {', '.join(quorum)}", "Starting build rounds")
 
         # Run build/quorum loop
         self.tracker = ConvergenceTracker()
@@ -466,6 +515,7 @@ SCOPE_REVIEW:
             print(f"\n{'─'*50}")
             print(f"📐 ROUND {round_num + 1}")
             print(f"{'─'*50}")
+            self.progress.update("building", f"Round {round_num + 1}", "Builder (codex) working...")
 
             # Reset repo before building (except round 0 where we keep prior work)
             if round_num > 0:
@@ -476,12 +526,16 @@ SCOPE_REVIEW:
 
             if not diff.strip():
                 print("⚠️  No diff produced")
+                self.progress.update("error", f"Round {round_num + 1}", "Builder produced no diff")
                 break
+
+            self.progress.update("reviewing", f"Round {round_num + 1}", f"Diff: {len(diff)} chars. Quorum reviewing...")
 
             # Quorum
             reviews = []
             if quorum:
                 for model in quorum:
+                    self.progress.update("reviewing", f"Round {round_num + 1}", f"Quorum ({model}) reviewing...")
                     review = self.run_reviewer(issue, model, round_num, diff, feedback)
                     reviews.append(review)
 
@@ -497,7 +551,12 @@ SCOPE_REVIEW:
                     "reason": reason,
                 })
 
+                self.progress.update("assessing", f"Round {round_num + 1}", f"Status: {status} — {reason}")
                 print(f"\n  📊 Camp Status: {status} — {reason}")
+
+                # Post round update to GitHub issue (live progress!)
+                round_summary = self._format_round_summary(round_num + 1, reviews, status, diff)
+                self.github.create_comment(number, round_summary)
 
                 # Decision tree
                 if status == "CONSENSUS":
@@ -514,30 +573,51 @@ SCOPE_REVIEW:
                     break
                 else:
                     # Continue to next round
-                    # Compile feedback for builder
                     feedback_parts = []
                     for r in reviews:
                         if r["verdict"] != "APPROVE":
                             feedback_parts.append(f"\n--- {r['model'].capitalize()} ---\n{r['raw_output'][:2000]}")
                     feedback = "\n".join(feedback_parts)
 
-                    # Check scope extension
                     scope_votes = [r["scope"] for r in reviews]
                     if "LEGITIMATE_DRIFT" in scope_votes and "SCOPE_CREEP" not in scope_votes:
                         scope_extended = True
                         print("    📐 Scope extended (legitimate drift approved by quorum)")
             else:
-                # No quorum, one-shot
                 round_reports.append({"round": 1, "diff": diff, "reviews": [], "status": "NO_QUORUM", "reason": "No quorum available"})
                 break
 
             round_num += 1
             if round_num >= 10:  # Safety cap
                 print("\n🛑 SAFETY CAP reached (10 rounds)")
+                self.progress.update("error", f"Round {round_num}", "Safety cap reached (10 rounds)")
                 break
 
-        # Post report
+        # Post final report
         self._post_report(issue, round_reports)
+
+    def _format_round_summary(self, round_num: int, reviews: List[Dict], status: str, diff: str) -> str:
+        """Format a live round update for posting to GitHub."""
+        lines = [f"### 📐 Round {round_num} Complete", ""]
+        lines.append(f"**Status:** {status}")
+        lines.append(f"**Diff:** {len(diff)} chars")
+        lines.append("")
+        for r in reviews:
+            emoji = "✅" if r["verdict"] == "APPROVE" else "❌"
+            scope = r.get("scope", "?")
+            lines.append(f"- {emoji} **{r['model'].capitalize()}**: {r['verdict']} | scope: {scope} | align: {r['alignment']:.2f}")
+        lines.append("")
+        if status == "PENDING":
+            lines.append("⏳ **Next:** Sending feedback to Builder for fixes...")
+        elif status == "CONSENSUS":
+            lines.append("✅ **Consensus reached!** Preparing final report...")
+        elif status == "CONVERGENCE":
+            lines.append("✅ **Convergence reached!** Issues fixed, minor new ones acceptable.")
+        elif status == "STALL":
+            lines.append("🛑 **Stalled.** Same issues persisting. Needs human.")
+        elif status == "HAZY":
+            lines.append("🌫️ **Hazy call.** Quorum disagrees on scope. Needs human.")
+        return "\n".join(lines)
 
     def _post_report(self, issue: Dict, round_reports: List[Dict]):
         number = issue["number"]
@@ -575,6 +655,8 @@ SCOPE_REVIEW:
 
         self.github.create_comment(number, report)
         self.github.add_label(number, "camp-complete")
+        if self.progress:
+            self.progress.done(status, len(round_reports))
         print(f"\n📋 Report posted to Issue #{number}")
 
     def poll(self, interval: int = 60):
