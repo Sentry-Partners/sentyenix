@@ -51,10 +51,24 @@ jobs:
           source .venv/bin/activate
           python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ steps.create_issue.outputs.issue_number }}
           
-      - name: Run orchestrator for issue
+      - name: Check if camp already completed
         if: github.event_name == 'issues'
+        id: check_complete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LABELS=$(gh issue view "${{ github.event.issue.number }}" --json labels -q '.labels[].name')
+          if echo "$LABELS" | grep -q "camp-complete"; then
+            echo "camp-complete label found — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          
+      - name: Run orchestrator for issue
+        if: github.event_name == 'issues' && steps.check_complete.outputs.skip != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           source .venv/bin/activate
-          python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number }}
+          python3 scripts/sentyenix_orchestrator.py --mode single --issue "${{ github.event.issue.number }}"
