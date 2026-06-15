@@ -381,17 +381,27 @@ class Orchestrator:
         # Generate consensus report
         consensus = self._generate_consensus(results, camp_name)
 
-        # Post results to GitHub
-        report = self._format_report(results, consensus, number)
-        self.github.create_comment(number, report)
-        self.github.add_label(number, "camp-complete")
+        # Post results to GitHub (if not running locally for testing)
+        if number > 0:
+            report = self._format_report(results, consensus, number)
+            self.github.create_comment(number, report)
+            self.github.add_label(number, "camp-complete")
 
-        # If high alignment, auto-close; otherwise keep open for human review
-        if consensus["alignment"] > 0.7:
-            self.github.close_issue(number)
-            print(f"\n✅ Issue #{number} closed (alignment: {consensus['alignment']:.2f})")
+            # If high alignment, auto-close; otherwise keep open for human review
+            if consensus["alignment"] > 0.7:
+                self.github.close_issue(number)
+                print(f"\n✅ Issue #{number} closed (alignment: {consensus['alignment']:.2f})")
+            else:
+                print(f"\n⚠️ Issue #{number} left open for human review (alignment: {consensus['alignment']:.2f})")
         else:
-            print(f"\n⚠️ Issue #{number} left open for human review (alignment: {consensus['alignment']:.2f})")
+            print(f"\n📋 Local test complete - alignment: {consensus['alignment']:.2f}")
+            print(f"\n{'='*60}")
+            print("CONSENSUS REPORT")
+            print(f"{'='*60}")
+            print(f"Camp: {consensus['camp']}")
+            print(f"Alignment: {consensus['alignment']:.2f}")
+            print(f"Agents: {consensus['agent_count']}")
+            print(f"\n{'='*60}")
 
     def _analyze_issue(self, issue: Dict) -> tuple:
         """Determine camp and models from issue content."""
