@@ -176,6 +176,7 @@ class ConvergenceTracker:
 
         state = {
             "round": round_num,
+            "reviews": reviews,
             "issues": issues,  # List of found issues
             "scope_votes": scope_votes,  # {model: "on_track" | "legitimate_drift" | "scope_creep"}
             "diff_size": len(diff),
@@ -220,7 +221,9 @@ class ConvergenceTracker:
         latest = self.rounds[-1]
         reviews = latest.get("reviews", [])
 
-        # Check for unanimous approval
+        # Check for unanimous approval (guard against empty reviews)
+        if not reviews:
+            return "PENDING", "No reviews in this round"
         all_approve = all(r.get("verdict") == "APPROVE" for r in reviews)
         if all_approve:
             return "CONSENSUS", "All quorum members approve"
@@ -248,7 +251,8 @@ class ConvergenceTracker:
         # CONVERGENCE: Prior issues addressed, maybe minor new ones
         fixed = prev_issues - curr_issues
         new = curr_issues - prev_issues
-        if len(fixed) > 0 and len(new) <= len(fixed):
+        critical_new = [issue for issue in new if self._is_critical_issue(issue)]
+        if len(fixed) > 0 and len(new) <= len(fixed) and not critical_new:
             return "CONVERGENCE", f"Fixed {len(fixed)} issues, {len(new)} new minor issues"
 
         return "PENDING", f"Progressing: fixed {len(prev_issues - curr_issues)}, new {len(new)}"
@@ -259,6 +263,22 @@ class ConvergenceTracker:
         text = re.sub(r'\d+', 'N', issue.lower())
         text = re.sub(r'[/\.]\w+', 'FILE', text)
         return text[:80]
+
+    def _is_critical_issue(self, issue: str) -> bool:
+        """Detect issues that should block convergence even if other items improved."""
+        critical_terms = (
+            "critical",
+            "security",
+            "vulnerability",
+            "data loss",
+            "corruption",
+            "regression",
+            "crash",
+            "blocking",
+            "must fix",
+            "unsafe",
+        )
+        return any(term in issue for term in critical_terms)
 
 # ── MAT Orchestrator ────────────────────────────────────────────────────────
 
