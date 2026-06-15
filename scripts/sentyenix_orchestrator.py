@@ -49,7 +49,7 @@ MODEL_FAMILIES = {
     # Grok and Kimi can be added when their CLIs are available
     "kimi": {
         "cli": "kimi",
-        "args": ["-p", "--yolo"],
+        "args": ["-p"],
         "path": "/Users/carlos/.kimi-code/bin",
         "auth_check": "export PATH='/Users/carlos/.kimi-code/bin:$PATH' && kimi -p 'hi' 2>&1 | head -1",
         "auth_fail_strings": ["not authenticated", "login", "unauthorized", "auth"],
