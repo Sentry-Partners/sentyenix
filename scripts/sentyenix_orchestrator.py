@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Sentyenix Orchestrator — Builder/Quorum MAT Protocol
+Sentyenix Orchestrator — MAT Protocol v2.1
 
-Flow:
-1. Codex (Builder) implements the issue
-2. Claude + Kimi (Quorum) review the diff
-3. If consensus not reached, Builder fixes based on feedback
-4. Repeat until consensus or max rounds
+Builder/Quorum loop with convergence detection and scope guarding:
 
-Usage:
-    python sentyenix_orchestrator.py --mode single --issue 42
-    python sentyenix_orchestrator.py --mode poll --interval 60
+1. Codex (Builder) implements
+2. Claude + Kimi (Quorum) review:
+   a. Technical: Are bugs real? Getting fixed?
+   b. Scope: Is work on-track or drifting?
+3. Loop continues while progress is being made
+4. Stop when: consensus, convergence, stall, or hazy call
+
+Stop conditions:
+- CONSENSUS: All quorum members APPROVE
+- CONVERGENCE: All prior round issues addressed, no new critical issues
+- STALL: Same issues reappear without progress (generational drift)
+- HAZY: Quorum members disagree on scope/legitimacy → human needed
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -31,7 +37,6 @@ import requests
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = "Sentry-Partners/sentyenix"
 SENTYENIX_ROOT = Path.home() / ".kimi_openclaw" / "workspace" / "sentyenix"
-MAX_BUILD_ROUNDS = 3
 
 MODEL_FAMILIES = {
     "claude": {
@@ -72,6 +77,13 @@ class GitHubAPI:
         }
         self.base = f"https://api.github.com/repos/{repo}"
 
+    def get_issues(self, labels: str = "spawn", state: str = "open") -> List[Dict]:
+        url = f"{self.base}/issues"
+        params = {"labels": labels, "state": state, "per_page": 10}
+        resp = requests.get(url, headers=self.headers, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     def get_issue(self, number: int) -> Dict:
         url = f"{self.base}/issues/{number}"
         resp = requests.get(url, headers=self.headers)
@@ -96,7 +108,7 @@ class GitHubAPI:
         resp.raise_for_status()
         return resp.json()
 
-# ── Agent Registry ──────────────────────────────────────────────────────────
+# ── Registry ────────────────────────────────────────────────────────────────
 
 class AgentRegistry:
     def __init__(self, root: Path):
@@ -108,7 +120,7 @@ class AgentRegistry:
         if self.registry_file.exists():
             self.agents = json.loads(self.registry_file.read_text())
         else:
-            self.agents = {"agents": [], "version": "2.0.0", "last_updated": None}
+            self.agents = {"agents": [], "version": "2.1.0", "last_updated": None}
 
     def _save(self):
         self.agents["last_updated"] = datetime.now(timezone.utc).isoformat()
@@ -124,30 +136,14 @@ class AgentRegistry:
             "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "trust_score": 0.5,
-            "build_rounds": 0,
-            "reviews_completed": 0,
         }
         self.agents["agents"].append(agent)
         self._save()
         return agent
 
-    def get_agent(self, agent_id: str) -> Optional[Dict]:
-        for a in self.agents["agents"]:
-            if a["id"] == agent_id:
-                return a
-        return None
-
-    def update_field(self, agent_id: str, field: str, value):
-        agent = self.get_agent(agent_id)
-        if agent:
-            agent[field] = value
-            self._save()
-
 # ── CLI Runner ──────────────────────────────────────────────────────────────
 
 class CLIRunner:
-    """Runs model CLI commands with proper env setup."""
-
     @staticmethod
     def build_env(cli_info: Dict) -> Dict:
         env = {**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
@@ -158,396 +154,423 @@ class CLIRunner:
     @staticmethod
     def run(cmd: List[str], cwd: Path, env: Dict, timeout: int = 300) -> Tuple[int, str, str]:
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(cwd),
-                env=env,
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=str(cwd), env=env)
             return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
-            return -1, "", f"[TIMEOUT] Command timed out after {timeout}s"
+            return -1, "", f"[TIMEOUT] {timeout}s"
         except FileNotFoundError as e:
             return -1, "", f"[NOT FOUND] {e}"
 
-    @staticmethod
-    def run_shell(cmd: str, cwd: Path, env: Dict, timeout: int = 300) -> Tuple[int, str, str]:
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(cwd),
-                env=env,
-            )
-            return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            return -1, "", f"[TIMEOUT] Command timed out after {timeout}s"
-        except FileNotFoundError as e:
-            return -1, "", f"[NOT FOUND] {e}"
+# ── Convergence Tracker ─────────────────────────────────────────────────────
 
-# ── Builder / Quorum Orchestrator ───────────────────────────────────────────
+class ConvergenceTracker:
+    """Tracks issues across rounds to detect progress, stalls, or drift."""
 
-class BuilderQuorumOrchestrator:
-    """
-    Builder/Quorum loop:
-    1. Codex builds implementation
-    2. Claude + Kimi review the diff
-    3. If not consensus, Codex fixes based on feedback
-    4. Repeat until consensus or max rounds
-    """
+    def __init__(self):
+        self.rounds = []  # List of RoundState
 
+    def add_round(self, round_num: int, reviews: List[Dict], diff: str):
+        """Record a round's state."""
+        issues = self._extract_issues(reviews)
+        scope_votes = self._extract_scope_votes(reviews)
+
+        state = {
+            "round": round_num,
+            "issues": issues,  # List of found issues
+            "scope_votes": scope_votes,  # {model: "on_track" | "legitimate_drift" | "scope_creep"}
+            "diff_size": len(diff),
+        }
+        self.rounds.append(state)
+
+    def _extract_issues(self, reviews: List[Dict]) -> List[str]:
+        """Extract issue descriptions from reviews."""
+        all_issues = []
+        for r in reviews:
+            text = r.get("raw_output", "")
+            # Look for numbered issue lists
+            issues = re.findall(r'(?i)(?:bug|issue|problem|concern|risk)[^\n]*\n([^\n]+)', text)
+            all_issues.extend(issues[:5])  # Max 5 per reviewer
+        return all_issues
+
+    def _extract_scope_votes(self, reviews: List[Dict]) -> Dict[str, str]:
+        """Extract scope assessment from reviews."""
+        votes = {}
+        for r in reviews:
+            text = r.get("raw_output", "").lower()
+            model = r.get("model", "unknown")
+            if "scope creep" in text or "out of scope" in text or "drifting" in text:
+                votes[model] = "scope_creep"
+            elif "legitimate" in text or "should have anticipated" in text or "necessary extension" in text:
+                votes[model] = "legitimate_drift"
+            else:
+                votes[model] = "on_track"
+        return votes
+
+    def assess(self) -> Tuple[str, str]:
+        """
+        Returns (status, reason) where status is:
+        - CONSENSUS: All approve
+        - CONVERGENCE: Issues getting fixed, no new critical issues
+        - STALL: Same issues persisting without progress
+        - HAZY: Quorum disagrees on scope
+        """
+        if not self.rounds:
+            return "PENDING", "No rounds yet"
+
+        latest = self.rounds[-1]
+        reviews = latest.get("reviews", [])
+
+        # Check for unanimous approval
+        all_approve = all(r.get("verdict") == "APPROVE" for r in reviews)
+        if all_approve:
+            return "CONSENSUS", "All quorum members approve"
+
+        # Check for scope disagreement (HAZY)
+        scope_votes = latest.get("scope_votes", {})
+        vote_values = list(scope_votes.values())
+        if vote_values and len(set(vote_values)) > 1 and "scope_creep" in vote_values:
+            # Mixed votes including scope creep concern
+            return "HAZY", f"Quorum disagrees on scope: {scope_votes}"
+
+        # Need at least 2 rounds to assess convergence
+        if len(self.rounds) < 2:
+            return "PENDING", "Need more rounds to assess convergence"
+
+        prev = self.rounds[-2]
+        prev_issues = set(self._normalize_issue(i) for i in prev["issues"])
+        curr_issues = set(self._normalize_issue(i) for i in latest["issues"])
+
+        # STALL: Same issues keep appearing
+        persistent = curr_issues & prev_issues
+        if len(persistent) == len(curr_issues) and len(curr_issues) > 0:
+            return "STALL", f"Same issues persist: {persistent}"
+
+        # CONVERGENCE: Prior issues addressed, maybe minor new ones
+        fixed = prev_issues - curr_issues
+        new = curr_issues - prev_issues
+        if len(fixed) > 0 and len(new) <= len(fixed):
+            return "CONVERGENCE", f"Fixed {len(fixed)} issues, {len(new)} new minor issues"
+
+        return "PENDING", f"Progressing: fixed {len(prev_issues - curr_issues)}, new {len(new)}"
+
+    def _normalize_issue(self, issue: str) -> str:
+        """Normalize issue text for comparison."""
+        # Remove specific line numbers, file paths, etc.
+        text = re.sub(r'\d+', 'N', issue.lower())
+        text = re.sub(r'[/\.]\w+', 'FILE', text)
+        return text[:80]
+
+# ── MAT Orchestrator ────────────────────────────────────────────────────────
+
+class MATOrchestrator:
     def __init__(self, github: GitHubAPI, registry: AgentRegistry, repo_root: Path):
         self.github = github
         self.registry = registry
         self.repo_root = repo_root
         self.runner = CLIRunner()
+        self.tracker = ConvergenceTracker()
 
-    def check_model_available(self, model: str) -> bool:
+    def check_model(self, model: str) -> bool:
         cli_info = MODEL_FAMILIES.get(model)
         if not cli_info:
             return False
-
         env = self.runner.build_env(cli_info)
-
-        # Check binary exists
         rc, _, _ = self.runner.run(["which", cli_info["cli"]], self.repo_root, env, timeout=5)
         if rc != 0:
             return False
-
-        # Check auth
         if "auth_check" in cli_info:
-            rc, stdout, stderr = self.runner.run_shell(
-                cli_info["auth_check"], self.repo_root, env, timeout=10
-            )
-            output = (stdout + stderr).lower()
-            for fail_str in cli_info.get("auth_fail_strings", []):
-                if fail_str.lower() in output:
+            rc, out, err = self.runner.run(cli_info["auth_check"], self.repo_root, env, timeout=10)
+            output = (out + err).lower()
+            for fail in cli_info.get("auth_fail_strings", []):
+                if fail.lower() in output:
                     return False
-
         return True
 
     def get_git_diff(self) -> str:
-        """Get current diff from repo root."""
         env = self.runner.build_env({})
-        rc, stdout, stderr = self.runner.run_shell(
-            "git diff HEAD", self.repo_root, env, timeout=30
-        )
-        if rc != 0:
-            return f"[ERROR getting diff: {stderr[:200]}]"
-        return stdout
+        rc, stdout, _ = self.runner.run(["git", "diff", "HEAD"], self.repo_root, env, timeout=30)
+        return stdout if rc == 0 else ""
 
-    def run_builder(self, issue: Dict, round_num: int, prior_feedback: str = "") -> Tuple[str, str]:
-        """Run Codex as builder. Returns (output, diff)."""
+    def reset_to_head(self):
+        """Reset any uncommitted changes before a new build round."""
+        env = self.runner.build_env({})
+        self.runner.run(["git", "checkout", "--", "."], self.repo_root, env, timeout=10)
+        self.runner.run(["git", "clean", "-fd"], self.repo_root, env, timeout=10)
+
+    def run_builder(self, issue: Dict, round_num: int, feedback: str, scope_extended: bool = False) -> Tuple[str, str]:
         model = "codex"
         cli_info = MODEL_FAMILIES[model]
         env = self.runner.build_env(cli_info)
 
-        agent_id = f"builder-codex-{issue['number']}-r{round_num}"
-        agent = self.registry.register(agent_id, f"Builder (Codex) R{round_num}", model, f"Issue-{issue['number']}", "builder")
+        agent_id = f"builder-{model}-{issue['number']}-r{round_num}"
+        self.registry.register(agent_id, f"Builder ({model}) R{round_num}", model, f"Issue-{issue['number']}", "builder")
 
         title = issue.get("title", "")
         body = issue.get("body", "")
 
         if round_num == 0:
-            prompt = f"""You are the Builder for this issue.
+            prompt = f"""You are the Builder. Implement this issue in the repository at {self.repo_root}.
 
 Issue: {title}
 Description: {body}
 
-Your task: Implement the necessary code changes in the repository at {self.repo_root}.
-Make focused, minimal changes that solve the issue.
-When you are done making changes, stop. Do not commit or push.
+Make focused, minimal changes that solve the issue. Stop when done. Do not commit or push.
 """
         else:
-            prompt = f"""You are the Builder fixing issues identified by the Quorum.
+            prompt = f"""You are the Builder fixing issues from the Quorum review.
 
 Issue: {title}
 
-Previous round feedback from Quorum:
-{prior_feedback}
+Quorum feedback from previous round:
+{feedback}
 
-Current diff in the repo:
+Current diff:
 ```diff
 {self.get_git_diff()}
 ```
 
-Your task: Address ALL the feedback above. Make additional changes as needed.
-When done, stop. Do not commit or push.
+Address ALL feedback. Make focused changes. Stop when done. Do not commit or push.
 """
 
         cmd = [cli_info["cli"]] + cli_info["args"] + [prompt]
-        print(f"\n  🔨 Builder Round {round_num}: Codex building...")
+        print(f"\n  🔨 Builder R{round_num}: {model} building...")
 
         rc, stdout, stderr = self.runner.run(cmd, self.repo_root, env, timeout=300)
-
-        # Build output includes both stdout and any error info
         output = stdout
         if rc != 0 and stderr:
-            output += f"\n[BUILDER STDERR]: {stderr[:500]}"
+            output += f"\n[BUILDER ERR]: {stderr[:500]}"
 
-        # Capture the diff after building
         diff = self.get_git_diff()
-
-        self.registry.update_field(agent_id, "build_rounds", round_num + 1)
-        print(f"    Diff size: {len(diff)} chars")
-
+        print(f"    Diff: {len(diff)} chars")
         return output, diff
 
-    def run_reviewer(self, issue: Dict, model: str, round_num: int, diff: str) -> Dict:
-        """Run a quorum member (Claude or Kimi) as reviewer. Returns parsed review."""
+    def run_reviewer(self, issue: Dict, model: str, round_num: int, diff: str, prior_reviews: str = "") -> Dict:
         cli_info = MODEL_FAMILIES[model]
         env = self.runner.build_env(cli_info)
 
         agent_id = f"quorum-{model}-{issue['number']}-r{round_num}"
-        agent = self.registry.register(agent_id, f"Quorum ({model.capitalize()}) R{round_num}", model, f"Issue-{issue['number']}", "quorum")
+        self.registry.register(agent_id, f"Quorum ({model}) R{round_num}", model, f"Issue-{issue['number']}", "quorum")
 
-        title = issue.get("title", "")
+        prompt = f"""You are a Quorum Reviewer. Review this code diff for the issue.
 
-        prompt = f"""You are a Quorum Reviewer reviewing code changes for this issue.
+Issue: {issue.get('title', '')}
 
-Issue: {title}
-
-Here is the diff produced by the Builder:
 ```diff
-{diff[:8000]}
+{diff[:10000]}
 ```
 
-Review this code carefully. Respond in this exact format:
+Respond in this EXACT format:
 
-VERDICT: APPROVE or REQUEST_CHANGES
+TECHNICAL_VERDICT: APPROVE or REQUEST_CHANGES
+SCOPE_ASSESSMENT: ON_TRACK or LEGITIMATE_DRIFT or SCOPE_CREEP
+ALIGNMENT: 0.0-1.0
 
-REVIEW:
-1. Your assessment of the changes
-2. Any bugs, security issues, or problems
+TECHNICAL_REVIEW:
+1. Assessment of the changes
+2. Bugs, security issues, or problems found (be specific)
 3. Specific changes needed (if any)
 
-ALIGNMENT: Score 0.0-1.0 (how well does this align with clean code, safety, correctness)
+SCOPE_REVIEW:
+1. Is this work still on track for the original issue?
+2. If there's new work, is it a legitimate extension the original plan should have anticipated?
+3. Or is this scope creep?
 """
 
         cmd = [cli_info["cli"]] + cli_info["args"] + [prompt]
         print(f"\n  🧐 Quorum ({model}): Reviewing...")
 
         rc, stdout, stderr = self.runner.run(cmd, self.repo_root, env, timeout=300)
-
         output = stdout
         if rc != 0 and stderr:
-            output += f"\n[REVIEWER STDERR]: {stderr[:500]}"
+            output += f"\n[REVIEWER ERR]: {stderr[:500]}"
 
-        self.registry.update_field(agent_id, "reviews_completed", round_num + 1)
-
-        # Parse the review
         review = self._parse_review(output)
         review["raw_output"] = output
         review["model"] = model
 
-        verdict_emoji = "✅" if review["verdict"] == "APPROVE" else "❌"
-        print(f"    {verdict_emoji} Verdict: {review['verdict']} (alignment: {review['alignment']:.2f})")
+        emoji = "✅" if review["verdict"] == "APPROVE" else "❌"
+        scope_emoji = {"ON_TRACK": "🎯", "LEGITIMATE_DRIFT": "📐", "SCOPE_CREEP": "🚫"}.get(review["scope"], "❓")
+        print(f"    {emoji} {model}: {review['verdict']} | {scope_emoji} {review['scope']} | align: {review['alignment']:.2f}")
 
         return review
 
     def _parse_review(self, text: str) -> Dict:
-        """Parse structured review output."""
         text_lower = text.lower()
 
-        # Check for explicit verdict
+        # Technical verdict
         verdict = "REQUEST_CHANGES"
-        if "verdict: approve" in text_lower or "verdict:approve" in text_lower:
-            verdict = "APPROVE"
-        elif "approve" in text_lower and "request_changes" not in text_lower:
+        if "technical_verdict: approve" in text_lower:
             verdict = "APPROVE"
 
-        # Extract alignment score
+        # Scope assessment
+        scope = "ON_TRACK"
+        if "scope_creep" in text_lower or "scope assessment: scope_creep" in text_lower:
+            scope = "SCOPE_CREEP"
+        elif "legitimate_drift" in text_lower or "scope assessment: legitimate_drift" in text_lower:
+            scope = "LEGITIMATE_DRIFT"
+
+        # Alignment
         alignment = 0.5
-        alignment_match = re.search(r'alignment[:\s]+(\d+\.?\d*)', text_lower)
-        if alignment_match:
-            alignment = float(alignment_match.group(1))
-            alignment = max(0.0, min(1.0, alignment))
+        match = re.search(r'alignment[:\s]+(\d+\.?\d*)', text_lower)
+        if match:
+            alignment = max(0.0, min(1.0, float(match.group(1))))
 
-        # Extract review body (everything after "REVIEW:")
-        review_body = text
-        review_match = re.search(r'(?i)review[:\n](.*)', text, re.DOTALL)
-        if review_match:
-            review_body = review_match.group(1).strip()
-
-        return {
-            "verdict": verdict,
-            "alignment": alignment,
-            "review_body": review_body,
-        }
-
-    def check_consensus(self, reviews: List[Dict]) -> Tuple[bool, str]:
-        """Check if quorum has reached consensus. Returns (consensus_reached, feedback)."""
-        if not reviews:
-            return False, "No reviews received."
-
-        all_approve = all(r["verdict"] == "APPROVE" for r in reviews)
-        avg_alignment = sum(r["alignment"] for r in reviews) / len(reviews)
-
-        if all_approve and avg_alignment >= 0.7:
-            return True, "Quorum unanimously approves."
-
-        # Collect feedback for next round
-        feedback_parts = []
-        for r in reviews:
-            if r["verdict"] != "APPROVE":
-                feedback_parts.append(f"\n--- {r['model'].capitalize()} Reviewer ---\n{r['review_body'][:1500]}")
-
-        feedback = "\n".join(feedback_parts) if feedback_parts else "Quorum requests changes."
-        return False, feedback
+        return {"verdict": verdict, "scope": scope, "alignment": alignment}
 
     def process_issue(self, issue: Dict) -> None:
-        """Run the full builder/quorum loop for an issue."""
         number = issue["number"]
-        title = issue["title"]
-
         print(f"\n{'='*60}")
-        print(f"🏗️  Builder/Quorum Loop — Issue #{number}: {title}")
+        print(f"🏗️  MAT Camp — Issue #{number}: {issue.get('title', '')}")
         print(f"{'='*60}")
 
-        # Check which models are available
-        available = {m: self.check_model_available(m) for m in MODEL_FAMILIES}
-        print(f"\nModel availability:")
-        for model, avail in available.items():
-            emoji = "✅" if avail else "❌"
-            print(f"  {emoji} {model} ({MODEL_FAMILIES[model]['role']})")
+        # Check models
+        available = {m: self.check_model(m) for m in MODEL_FAMILIES}
+        print(f"\nModels: " + " ".join(f"{'✅' if v else '❌'} {k}" for k, v in available.items()))
 
         if not available.get("codex"):
-            print("❌ ERROR: Codex (builder) not available. Cannot proceed.")
+            print("❌ No builder available")
             return
 
-        quorum_models = [m for m in ["claude", "kimi"] if available.get(m)]
-        if len(quorum_models) < 1:
-            print("⚠️ WARNING: No quorum reviewers available. Running builder only.")
+        quorum = [m for m in ["claude", "kimi"] if available.get(m)]
+        if len(quorum) < 1:
+            print("⚠️  No quorum — running builder once")
 
-        # Run build rounds
-        diff = ""
-        consensus_reached = False
-        final_feedback = ""
+        # Run build/quorum loop
+        self.tracker = ConvergenceTracker()
+        round_num = 0
+        feedback = ""
+        scope_extended = False
         round_reports = []
 
-        for round_num in range(MAX_BUILD_ROUNDS):
+        while True:
             print(f"\n{'─'*50}")
-            print(f"📐 BUILD ROUND {round_num + 1}/{MAX_BUILD_ROUNDS}")
+            print(f"📐 ROUND {round_num + 1}")
             print(f"{'─'*50}")
 
-            # Builder phase
-            builder_output, diff = self.run_builder(issue, round_num, final_feedback)
+            # Reset repo before building (except round 0 where we keep prior work)
+            if round_num > 0:
+                self.reset_to_head()
 
-            if not diff.strip() or diff.startswith("[ERROR"):
-                print("⚠️  No diff produced. Stopping.")
+            # Builder
+            builder_output, diff = self.run_builder(issue, round_num, feedback, scope_extended)
+
+            if not diff.strip():
+                print("⚠️  No diff produced")
                 break
 
-            # Quorum phase
+            # Quorum
             reviews = []
-            if quorum_models:
-                for model in quorum_models:
-                    review = self.run_reviewer(issue, model, round_num, diff)
+            if quorum:
+                for model in quorum:
+                    review = self.run_reviewer(issue, model, round_num, diff, feedback)
                     reviews.append(review)
 
-                consensus_reached, final_feedback = self.check_consensus(reviews)
+                # Track this round
+                self.tracker.add_round(round_num, reviews, diff)
+                status, reason = self.tracker.assess()
 
-                round_report = {
+                round_reports.append({
                     "round": round_num + 1,
-                    "builder_output": builder_output,
                     "diff": diff,
                     "reviews": reviews,
-                    "consensus": consensus_reached,
-                }
-                round_reports.append(round_report)
+                    "status": status,
+                    "reason": reason,
+                })
 
-                if consensus_reached:
-                    print(f"\n✅ CONSENSUS REACHED at round {round_num + 1}")
+                print(f"\n  📊 Camp Status: {status} — {reason}")
+
+                # Decision tree
+                if status == "CONSENSUS":
+                    print(f"\n✅ CONSENSUS reached")
+                    break
+                elif status == "CONVERGENCE":
+                    print(f"\n✅ CONVERGENCE — issues being fixed, minor new ones acceptable")
+                    break
+                elif status == "STALL":
+                    print(f"\n🛑 STALL — generational drift detected")
+                    break
+                elif status == "HAZY":
+                    print(f"\n🌫️  HAZY — quorum disagrees, needs human")
                     break
                 else:
-                    print(f"\n❌ No consensus. Feedback collected for next round.")
-                    if round_num < MAX_BUILD_ROUNDS - 1:
-                        print("    → Sending feedback to Builder for fixes...")
+                    # Continue to next round
+                    # Compile feedback for builder
+                    feedback_parts = []
+                    for r in reviews:
+                        if r["verdict"] != "APPROVE":
+                            feedback_parts.append(f"\n--- {r['model'].capitalize()} ---\n{r['raw_output'][:2000]}")
+                    feedback = "\n".join(feedback_parts)
+
+                    # Check scope extension
+                    scope_votes = [r["scope"] for r in reviews]
+                    if "LEGITIMATE_DRIFT" in scope_votes and "SCOPE_CREEP" not in scope_votes:
+                        scope_extended = True
+                        print("    📐 Scope extended (legitimate drift approved by quorum)")
             else:
-                # No quorum, just one-shot build
-                consensus_reached = True
-                final_feedback = "No quorum available. Builder output accepted."
+                # No quorum, one-shot
+                round_reports.append({"round": 1, "diff": diff, "reviews": [], "status": "NO_QUORUM", "reason": "No quorum available"})
                 break
 
-        # Final report
-        self._post_final_report(issue, round_reports, consensus_reached, diff)
+            round_num += 1
+            if round_num >= 10:  # Safety cap
+                print("\n🛑 SAFETY CAP reached (10 rounds)")
+                break
 
-    def _post_final_report(self, issue: Dict, round_reports: List[Dict], consensus: bool, final_diff: str):
-        """Post the final camp report to GitHub."""
+        # Post report
+        self._post_report(issue, round_reports)
+
+    def _post_report(self, issue: Dict, round_reports: List[Dict]):
         number = issue["number"]
 
-        report = f"""## 🏕️ Builder/Quorum Camp Report
+        final = round_reports[-1] if round_reports else {"status": "UNKNOWN", "reason": "No rounds"}
+        status = final["status"]
+
+        report = f"""## 🏕️ MAT Camp Report
 
 **Issue:** {issue.get('title', 'Unknown')}
-**Consensus:** {'✅ Reached' if consensus else '❌ Not reached (max rounds)'}
+**Final Status:** {status}
 **Rounds:** {len(round_reports)}
 **Time:** {datetime.now(timezone.utc).isoformat()}
 
 ### Build Rounds
 """
         for r in round_reports:
-            report += f"\n#### Round {r['round']}\n"
-            report += f"- **Builder:** Codex\n"
-            report += f"- **Diff size:** {len(r['diff'])} chars\n"
-            report += f"- **Consensus:** {'✅ Yes' if r['consensus'] else '❌ No'}\n"
-
-            for review in r["reviews"]:
+            report += f"\n#### Round {r['round']} — {r['status']}\n"
+            report += f"- Diff: {len(r['diff'])} chars\n"
+            for review in r.get("reviews", []):
                 emoji = "✅" if review["verdict"] == "APPROVE" else "❌"
-                report += f"\n**{emoji} {review['model'].capitalize()} Reviewer** (alignment: {review['alignment']:.2f})\n"
-                report += f"```\n{review['review_body'][:800]}\n```\n"
+                scope = review.get("scope", "?")
+                report += f"- {emoji} **{review['model'].capitalize()}**: {review['verdict']} | scope: {scope} | align: {review['alignment']:.2f}\n"
 
-        report += f"\n### Final Diff\n"
-        report += f"```diff\n{final_diff[:2000]}\n```\n"
-        if len(final_diff) > 2000:
-            report += f"*(truncated — full diff in working tree)*\n"
-
-        report += f"\n### Next Steps\n"
-        if consensus:
-            report += "- ✅ Quorum approves. Ready for human review and merge.\n"
+        report += f"\n### Decision\n"
+        if status in ("CONSENSUS", "CONVERGENCE"):
+            report += "✅ **Camp approves.** Ready for human review/merge.\n"
+            self.github.close_issue(number)
+        elif status == "STALL":
+            report += "🛑 **Stalled.** Builder unable to resolve persistent issues. Needs human.\n"
+        elif status == "HAZY":
+            report += "🌫️ **Hazy call.** Quorum disagrees on scope/legitimacy. Needs human.\n"
         else:
-            report += "- ❌ Quorum did not reach consensus within max rounds. Needs human intervention.\n"
+            report += "⚠️ **Incomplete.** Camp ended without clear resolution. Needs human.\n"
 
         self.github.create_comment(number, report)
         self.github.add_label(number, "camp-complete")
-
-        if consensus:
-            print(f"\n✅ Issue #{number} marked camp-complete (consensus reached)")
-        else:
-            print(f"\n⚠️ Issue #{number} marked camp-complete (no consensus — needs human)")
-
-# ── Backwards-compatible Orchestrator wrapper ───────────────────────────────
-
-class Orchestrator:
-    """Wrapper that routes to BuilderQuorumOrchestrator."""
-
-    def __init__(self, github: GitHubAPI, registry: AgentRegistry, spawner, scorer, repo_root: Path):
-        self.bq = BuilderQuorumOrchestrator(github, registry, repo_root)
-
-    def process_issue(self, issue: Dict) -> None:
-        self.bq.process_issue(issue)
+        print(f"\n📋 Report posted to Issue #{number}")
 
     def poll(self, interval: int = 60):
-        print(f"Sentyenix Orchestrator starting (Builder/Quorum mode)...")
+        print(f"MAT Orchestrator v2.1 starting...")
         print(f"Repo: {GITHUB_REPO}")
-        print(f"Polling interval: {interval}s")
-        print(f"Press Ctrl+C to stop\n")
-
         processed = set()
 
         while True:
             try:
-                issues = self.bq.github.get_issues(labels="spawn,auto", state="open")
-                print(f"[{datetime.now(timezone.utc).isoformat()}] Found {len(issues)} open spawn issues")
+                issues = self.github.get_issues(labels="spawn,auto", state="open")
+                print(f"[{datetime.now(timezone.utc).isoformat()}] {len(issues)} open spawn issues")
 
                 for issue in issues:
                     number = issue["number"]
                     if number in processed:
                         continue
-
                     labels = [l["name"] for l in issue.get("labels", [])]
                     if "camp-complete" in labels:
                         processed.add(number)
@@ -557,55 +580,38 @@ class Orchestrator:
                     processed.add(number)
 
                 time.sleep(interval)
-
             except KeyboardInterrupt:
                 print("\nShutting down...")
                 break
             except Exception as e:
-                print(f"Error during poll: {e}")
+                print(f"Error: {e}")
                 time.sleep(interval)
-
-# Monkey-patch GitHubAPI for poll mode
-def _get_issues(self, labels: str = "spawn", state: str = "open") -> List[Dict]:
-    url = f"{self.base}/issues"
-    params = {"labels": labels, "state": state, "per_page": 10}
-    resp = requests.get(url, headers=self.headers, params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-GitHubAPI.get_issues = _get_issues
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Sentyenix Orchestrator")
-    parser.add_argument("--mode", choices=["poll", "single", "registry"], default="poll")
-    parser.add_argument("--issue", type=int, help="Issue number for single mode")
-    parser.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
+    parser = argparse.ArgumentParser(description="MAT Orchestrator v2.1")
+    parser.add_argument("--mode", choices=["poll", "single"], default="poll")
+    parser.add_argument("--issue", type=int)
+    parser.add_argument("--interval", type=int, default=60)
     args = parser.parse_args()
 
     if not GITHUB_TOKEN:
-        print("ERROR: GITHUB_TOKEN environment variable required")
+        print("ERROR: GITHUB_TOKEN required")
         sys.exit(1)
 
     github = GitHubAPI(GITHUB_TOKEN, GITHUB_REPO)
     registry = AgentRegistry(SENTYENIX_ROOT)
-    spawner = None  # Not used in builder/quorum mode
-    scorer = None   # Not used in builder/quorum mode
-    orchestrator = Orchestrator(github, registry, spawner, scorer, SENTYENIX_ROOT)
+    orchestrator = MATOrchestrator(github, registry, SENTYENIX_ROOT)
 
     if args.mode == "poll":
         orchestrator.poll(args.interval)
     elif args.mode == "single":
         if args.issue is None:
-            print("ERROR: --issue required for single mode")
+            print("ERROR: --issue required")
             sys.exit(1)
         issue = github.get_issue(args.issue)
         orchestrator.process_issue(issue)
-    elif args.mode == "registry":
-        print(f"Agent Registry ({len(registry.all_agents())} agents):")
-        for a in registry.all_agents():
-            print(f"  {a['name']} ({a['model']}) - camp={a['camp']}, role={a['role']}, trust={a['trust_score']:.2f}")
 
 if __name__ == "__main__":
     main()
