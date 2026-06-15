@@ -36,18 +36,20 @@ SENTYENIX_ROOT = Path.home() / ".kimi_openclaw" / "workspace" / "sentyenix"
 MODEL_FAMILIES = {
     "claude": {
         "cli": "claude",
-        "args": ["-p", "--permission-mode", "bypassPermissions", "--bare"],
-        "output_redirect": None,  # -p prints directly to stdout
+        "args": ["-p", "--permission-mode", "bypassPermissions"],
+        "auth_check": "claude -p 'hi' 2>&1 | head -1",
+        "auth_fail_strings": ["Not logged in", "login", "Please run"],
     },
     "codex": {
         "cli": "codex",
         "args": ["-a", "never", "exec", "--skip-git-repo-check", "-s", "read-only"],
-        "output_redirect": None,
+        "auth_check": "codex -a never exec --skip-git-repo-check -s read-only 'hi' 2>&1 | head -1",
+        "auth_fail_strings": ["auth", "login", "API key", "not authenticated"],
     },
     # Grok and Kimi can be added when their CLIs are available
     # "grok": ...
     # "kimi": ...
-    # "gemma": {"cli": "ollama", "args": ["run", "gemma4:31b"], "output_redirect": None}
+    # "gemma": {"cli": "ollama", "args": ["run", "gemma4:31b"]}
 }
 
 # ── GitHub API ────────────────────────────────────────────────────────────────
@@ -190,23 +192,63 @@ class CampSpawner:
         self.registry = registry
         self.repo_root = repo_root
 
+    def check_model_available(self, model: str) -> bool:
+        """Check if a model CLI is available and authenticated."""
+        cli_info = MODEL_FAMILIES.get(model)
+        if not cli_info:
+            return False
+        
+        # Check if CLI binary exists
+        try:
+            result = subprocess.run(
+                ["which", cli_info["cli"]],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        
+        # Check auth
+        if "auth_check" in cli_info:
+            try:
+                result = subprocess.run(
+                    cli_info["auth_check"],
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=str(self.repo_root),
+                    env={**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
+                )
+                output = (result.stdout + result.stderr).lower()
+                for fail_str in cli_info.get("auth_fail_strings", []):
+                    if fail_str.lower() in output:
+                        return False
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                return False
+        
+        return True
+
     def spawn_camp(self, camp_name: str, purpose: str, models: List[str],
                      temperature_range: List[float], issue_number: int) -> List[Dict]:
         """
         Spawn a multi-lineage camp.
-
-        Args:
-            camp_name: Name of the camp
-            purpose: What the camp needs to do
-            models: List of model families to use
-            temperature_range: Temperatures for each agent
-            issue_number: The GitHub issue this camp is working on
         """
+        # Filter to available models only
+        available = [m for m in models if self.check_model_available(m)]
+        if len(available) < 2:
+            print(f"WARNING: Only {len(available)} models available. Need at least 2 for multi-lineage.")
+            # Still try with what we have
+        
         agents = []
-        for i, (model, temp) in enumerate(zip(models, temperature_range)):
+        for i, model in enumerate(available[:3]):  # Max 3 agents per camp
+            temp = temperature_range[i] if i < len(temperature_range) else 0.5
             agent_id = f"{camp_name.lower().replace(' ', '-')}-{model}-{i}-{int(time.time())}"
             name = f"{camp_name} Agent {i+1} ({model})"
-            role = self._assign_role(i, len(models))
+            role = self._assign_role(i, len(available))
             capabilities = self._infer_capabilities(model, role)
 
             agent = self.registry.register(
