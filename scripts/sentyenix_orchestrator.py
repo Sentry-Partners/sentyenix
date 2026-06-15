@@ -564,7 +564,7 @@ def main():
     if args.mode == "poll":
         orchestrator.poll(args.interval)
     elif args.mode == "single":
-        if not args.issue:
+        if args.issue is None:
             print("ERROR: --issue required for single mode")
             sys.exit(1)
         issue = github.get_issue(args.issue)
