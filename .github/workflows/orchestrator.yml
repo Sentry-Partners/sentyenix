@@ -31,7 +31,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ISSUE_NUM=$(gh issue create --title "[SPAWN] Push: ${{ github.event.head_commit.message }}" --body "Auto-generated camp activation for push to main." | grep -oE '#[0-9]+' | tr -d '#')
+          ISSUE_URL=$(gh issue create --title "[SPAWN] Push: ${{ github.event.head_commit.message }}" --body "Auto-generated camp activation for push to main.")
+          ISSUE_NUM=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
           echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
           
       - name: Run orchestrator for push
