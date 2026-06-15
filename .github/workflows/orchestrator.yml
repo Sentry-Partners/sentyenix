@@ -23,7 +23,9 @@ jobs:
         id: detect
         run: |
           echo "changed_files=${{ join(github.event.head_commit.modified, ',') }}" >> $GITHUB_OUTPUT
-          echo "commit_message=${{ github.event.head_commit.message }}" >> $GITHUB_OUTPUT
+          echo 'commit_message<<EOF' >> $GITHUB_OUTPUT
+          echo "${{ github.event.head_commit.message }}" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
           
       - name: Create issue for push
         if: github.event_name == 'push'
@@ -31,7 +33,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ISSUE_URL=$(gh issue create --title "[SPAWN] Push: ${{ github.event.head_commit.message }}" --body "Auto-generated camp activation for push to main.")
+          COMMIT_TITLE=$(echo "${{ github.event.head_commit.message }}" | head -n 1)
+          ISSUE_URL=$(gh issue create --title "[SPAWN] Push: $COMMIT_TITLE" --body "Auto-generated camp activation for push to main.")
           ISSUE_NUM=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
           echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
           
