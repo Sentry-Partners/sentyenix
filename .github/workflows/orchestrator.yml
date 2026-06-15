@@ -27,11 +27,27 @@ jobs:
           
       - name: Spawn camp for push
         if: github.event_name == 'push'
+        id: spawn_push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUM=$(gh issue create \
+            --title "[SPAWN] Push: ${{ github.event.head_commit.message }}" \
+            --body "Auto-generated camp activation for push to main.
+
+**Commit:** ${{ github.sha }}
+**Author:** ${{ github.event.head_commit.author.name }}" \
+            --label "spawn,auto" \
+            | grep -oE '#[0-9]+' | tr -d '#')
+          echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
+          
+      - name: Run orchestrator for push
+        if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           source .venv/bin/activate
-          python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number || '0' }}
+          python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ steps.spawn_push.outputs.issue_number }}
           
       - name: Spawn camp for issue
         if: github.event_name == 'issues'
