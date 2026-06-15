@@ -13,14 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      
       - name: Install dependencies
         run: |
-          pip install -r scripts/requirements.txt
+          python3 -m pip install --user -r scripts/requirements.txt
       
       - name: Detect and route
         id: detect
@@ -33,11 +28,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number || '0' }}
+          python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number || '0' }}
           
       - name: Spawn camp for issue
         if: github.event_name == 'issues'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number }}
+          python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number }}
