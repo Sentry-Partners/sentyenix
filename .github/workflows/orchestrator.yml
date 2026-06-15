@@ -15,7 +15,9 @@ jobs:
       
       - name: Install dependencies
         run: |
-          python3 -m pip install --user -r scripts/requirements.txt
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -r scripts/requirements.txt
       
       - name: Detect and route
         id: detect
@@ -28,6 +30,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          source .venv/bin/activate
           python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number || '0' }}
           
       - name: Spawn camp for issue
@@ -35,4 +38,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          source .venv/bin/activate
           python3 scripts/sentyenix_orchestrator.py --mode single --issue ${{ github.event.issue.number }}
