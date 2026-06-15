@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """
-Sentyenix Orchestrator
+Sentyenix Orchestrator — Builder/Quorum MAT Protocol
 
-Local orchestrator that:
-1. Polls GitHub for [SPAWN] issues
-2. Spawns multi-lineage camps using Claude/Codex CLI
-3. Coordinates camp deliberation
-4. Reports results back to GitHub
-5. Manages the agent registry
+Flow:
+1. Codex (Builder) implements the issue
+2. Claude + Kimi (Quorum) review the diff
+3. If consensus not reached, Builder fixes based on feedback
+4. Repeat until consensus or max rounds
 
 Usage:
-    python sentyenix_orchestrator.py --mode poll --interval 60
     python sentyenix_orchestrator.py --mode single --issue 42
+    python sentyenix_orchestrator.py --mode poll --interval 60
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -31,34 +31,36 @@ import requests
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = "Sentry-Partners/sentyenix"
 SENTYENIX_ROOT = Path.home() / ".kimi_openclaw" / "workspace" / "sentyenix"
+MAX_BUILD_ROUNDS = 3
 
-# Model families available for multi-lineage camps
 MODEL_FAMILIES = {
     "claude": {
         "cli": "claude",
         "args": ["-p", "--permission-mode", "bypassPermissions"],
+        "path": None,
+        "role": "quorum",
         "auth_check": "claude -p 'hi' 2>&1 | head -1",
         "auth_fail_strings": ["Not logged in", "login", "Please run"],
     },
     "codex": {
         "cli": "codex",
-        "args": ["-a", "never", "exec", "--skip-git-repo-check", "-s", "read-only"],
+        "args": ["exec", "--full-auto"],
+        "path": None,
+        "role": "builder",
         "auth_check": "codex -a never exec --skip-git-repo-check -s read-only 'hi' 2>&1 | head -1",
         "auth_fail_strings": ["auth", "login", "API key", "not authenticated"],
     },
-    # Grok and Kimi can be added when their CLIs are available
     "kimi": {
         "cli": "kimi",
         "args": ["-p"],
         "path": "/Users/carlos/.kimi-code/bin",
+        "role": "quorum",
         "auth_check": "export PATH='/Users/carlos/.kimi-code/bin:$PATH' && kimi -p 'hi' 2>&1 | head -1",
         "auth_fail_strings": ["not authenticated", "login", "unauthorized", "auth"],
     },
-    # "grok": ...
-    # "gemma": {"cli": "ollama", "args": ["run", "gemma4:31b"]}
 }
 
-# ── GitHub API ────────────────────────────────────────────────────────────────
+# ── GitHub API ──────────────────────────────────────────────────────────────
 
 class GitHubAPI:
     def __init__(self, token: str, repo: str):
@@ -69,13 +71,6 @@ class GitHubAPI:
             "Accept": "application/vnd.github.v3+json",
         }
         self.base = f"https://api.github.com/repos/{repo}"
-
-    def get_issues(self, labels: str = "spawn", state: str = "open") -> List[Dict]:
-        url = f"{self.base}/issues"
-        params = {"labels": labels, "state": state, "per_page": 10}
-        resp = requests.get(url, headers=self.headers, params=params)
-        resp.raise_for_status()
-        return resp.json()
 
     def get_issue(self, number: int) -> Dict:
         url = f"{self.base}/issues/{number}"
@@ -101,31 +96,7 @@ class GitHubAPI:
         resp.raise_for_status()
         return resp.json()
 
-    def get_issue_comments(self, number: int) -> List[Dict]:
-        url = f"{self.base}/issues/{number}/comments"
-        resp = requests.get(url, headers=self.headers)
-        resp.raise_for_status()
-        return resp.json()
-
-    def create_issue(self, title: str, body: str, labels: List[str]) -> Dict:
-        url = f"{self.base}/issues"
-        resp = requests.post(url, headers=self.headers, json={
-            "title": title,
-            "body": body,
-            "labels": labels,
-        })
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_file(self, path: str, ref: str = "main") -> str:
-        url = f"{self.base}/contents/{path}"
-        resp = requests.get(url, headers=self.headers, params={"ref": ref})
-        resp.raise_for_status()
-        data = resp.json()
-        import base64
-        return base64.b64decode(data["content"]).decode("utf-8")
-
-# ── Agent Registry ───────────────────────────────────────────────────────────
+# ── Agent Registry ──────────────────────────────────────────────────────────
 
 class AgentRegistry:
     def __init__(self, root: Path):
@@ -137,30 +108,24 @@ class AgentRegistry:
         if self.registry_file.exists():
             self.agents = json.loads(self.registry_file.read_text())
         else:
-            self.agents = {"agents": [], "version": "1.0.0", "last_updated": None}
+            self.agents = {"agents": [], "version": "2.0.0", "last_updated": None}
 
     def _save(self):
         self.agents["last_updated"] = datetime.now(timezone.utc).isoformat()
         self.registry_file.write_text(json.dumps(self.agents, indent=2))
 
-    def register(self, agent_id: str, name: str, model: str, temperature: float,
-                 camp: str, role: str, capabilities: List[str]) -> Dict:
-        import hashlib
-        signature = hashlib.sha256(f"{agent_id}:{model}:{temperature}:{camp}".encode()).hexdigest()[:16]
+    def register(self, agent_id: str, name: str, model: str, camp: str, role: str) -> Dict:
         agent = {
             "id": agent_id,
             "name": name,
             "model": model,
-            "temperature": temperature,
             "camp": camp,
             "role": role,
-            "capabilities": capabilities,
-            "genetic_signature": signature,
             "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "trust_score": 0.5,  # Start at probation
-            "alignment_history": [],
-            "interaction_count": 0,
+            "trust_score": 0.5,
+            "build_rounds": 0,
+            "reviews_completed": 0,
         }
         self.agents["agents"].append(agent)
         self._save()
@@ -172,413 +137,401 @@ class AgentRegistry:
                 return a
         return None
 
-    def list_by_camp(self, camp: str) -> List[Dict]:
-        return [a for a in self.agents["agents"] if a["camp"] == camp and a["status"] == "active"]
-
-    def update_score(self, agent_id: str, alignment: float):
+    def update_field(self, agent_id: str, field: str, value):
         agent = self.get_agent(agent_id)
         if agent:
-            agent["alignment_history"].append(alignment)
-            agent["interaction_count"] += 1
-            # Simple trust score calculation
-            recent = agent["alignment_history"][-10:]
-            avg = sum(recent) / len(recent) if recent else 0.5
-            agent["trust_score"] = min(0.9, 0.3 + avg * 0.6)
+            agent[field] = value
             self._save()
 
-    def all_agents(self) -> List[Dict]:
-        return self.agents["agents"]
+# ── CLI Runner ──────────────────────────────────────────────────────────────
 
-# ── Camp Spawner ──────────────────────────────────────────────────────────────
+class CLIRunner:
+    """Runs model CLI commands with proper env setup."""
 
-class CampSpawner:
-    """Spawns multi-lineage camps using available CLI tools."""
-
-    def __init__(self, registry: AgentRegistry, repo_root: Path):
-        self.registry = registry
-        self.repo_root = repo_root
-
-    def check_model_available(self, model: str) -> bool:
-        """Check if a model CLI is available and authenticated."""
-        cli_info = MODEL_FAMILIES.get(model)
-        if not cli_info:
-            return False
-        
-        # Build env with optional custom PATH
+    @staticmethod
+    def build_env(cli_info: Dict) -> Dict:
         env = {**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
-        if "path" in cli_info:
+        if cli_info.get("path"):
             env["PATH"] = f"{cli_info['path']}:{env.get('PATH', '')}"
-        
-        # Check if CLI binary exists
-        try:
-            result = subprocess.run(
-                ["which", cli_info["cli"]],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env=env,
-            )
-            if result.returncode != 0:
-                return False
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return False
-        
-        # Check auth
-        if "auth_check" in cli_info:
-            try:
-                result = subprocess.run(
-                    cli_info["auth_check"],
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    cwd=str(self.repo_root),
-                    env=env,
-                )
-                output = (result.stdout + result.stderr).lower()
-                for fail_str in cli_info.get("auth_fail_strings", []):
-                    if fail_str.lower() in output:
-                        return False
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                return False
-        
-        return True
+        return env
 
-    def spawn_camp(self, camp_name: str, purpose: str, models: List[str],
-                     temperature_range: List[float], issue_number: int) -> List[Dict]:
-        """
-        Spawn a multi-lineage camp.
-        """
-        # Filter to available models only
-        available = [m for m in models if self.check_model_available(m)]
-        if len(available) < 2:
-            print(f"WARNING: Only {len(available)} models available. Need at least 2 for multi-lineage.")
-            # Still try with what we have
-        
-        agents = []
-        for i, model in enumerate(available[:3]):  # Max 3 agents per camp
-            temp = temperature_range[i] if i < len(temperature_range) else 0.5
-            agent_id = f"{camp_name.lower().replace(' ', '-')}-{model}-{i}-{int(time.time())}"
-            name = f"{camp_name} Agent {i+1} ({model})"
-            role = self._assign_role(i, len(available))
-            capabilities = self._infer_capabilities(model, role)
-
-            agent = self.registry.register(
-                agent_id=agent_id,
-                name=name,
-                model=model,
-                temperature=temp,
-                camp=camp_name,
-                role=role,
-                capabilities=capabilities,
-            )
-            agents.append(agent)
-
-        return agents
-
-    def _assign_role(self, index: int, total: int) -> str:
-        roles = ["architect", "implementer", "critic", "analyst", "synthesizer"]
-        return roles[index % len(roles)]
-
-    def _infer_capabilities(self, model: str, role: str) -> List[str]:
-        base_caps = {
-            "claude": ["ethical_review", "system_design", "content_creation"],
-            "codex": ["code_review", "system_design", "incident_response"],
-            "grok": ["adversarial_testing", "data_analysis", "threat_analysis"],
-            "kimi": ["system_design", "ontology_design", "memory_optimization"],
-            "gemma": ["data_analysis", "code_review", "performance_analysis"],
-        }
-        caps = base_caps.get(model, ["general"])
-        if role == "architect":
-            return ["system_design"] + caps[:2]
-        elif role == "critic":
-            return ["adversarial_testing", "ethical_review"] + caps[:1]
-        elif role == "implementer":
-            return ["code_review", "incident_response"] + caps[:1]
-        return caps
-
-    def run_agent(self, agent: Dict, prompt: str, timeout: int = 300) -> str:
-        """
-        Run an agent via its CLI and return the result.
-        """
-        model = agent["model"]
-        cli_info = MODEL_FAMILIES.get(model)
-        if not cli_info:
-            return f"[ERROR] No CLI available for model {model}"
-
-        cli = cli_info["cli"]
-        args = cli_info["args"].copy()
-
-        # Build the full prompt with context
-        full_prompt = f"""You are {agent['name']}, a {agent['role']} in the {agent['camp']} camp.
-Your genetic signature is {agent['genetic_signature']}.
-Your temperature setting is {agent['temperature']}.
-
-You are part of a multi-lineage camp in Sentyenix, an agentic company.
-Your task: {prompt}
-
-Respond with a structured analysis including:
-1. Your position/assessment
-2. Key concerns or risks
-3. Recommendations
-4. Alignment with core values (score 0.0-1.0)
-"""
-
-        # Use the CLI
-        cmd = [cli] + args + [full_prompt]
-        
-        # Build env with optional custom PATH
-        env = {**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
-        if "path" in cli_info:
-            env["PATH"] = f"{cli_info['path']}:{env.get('PATH', '')}"
-        
+    @staticmethod
+    def run(cmd: List[str], cwd: Path, env: Dict, timeout: int = 300) -> Tuple[int, str, str]:
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd=str(self.repo_root),
+                cwd=str(cwd),
                 env=env,
             )
-            if result.returncode != 0:
-                err = result.stderr[:500]
-                if "Not logged in" in err or "login" in err.lower():
-                    return f"[ERROR] {model} CLI not authenticated: {err}"
-                return f"[ERROR] {model} CLI failed: {err}"
-            return result.stdout
+            return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
-            return f"[ERROR] {model} CLI timed out after {timeout}s"
-        except FileNotFoundError:
-            return f"[ERROR] {model} CLI not found at {cli}"
+            return -1, "", f"[TIMEOUT] Command timed out after {timeout}s"
+        except FileNotFoundError as e:
+            return -1, "", f"[NOT FOUND] {e}"
 
-# ── Reflek Alignment Scorer ───────────────────────────────────────────────────
+    @staticmethod
+    def run_shell(cmd: str, cwd: Path, env: Dict, timeout: int = 300) -> Tuple[int, str, str]:
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(cwd),
+                env=env,
+            )
+            return result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            return -1, "", f"[TIMEOUT] Command timed out after {timeout}s"
+        except FileNotFoundError as e:
+            return -1, "", f"[NOT FOUND] {e}"
 
-class ReflekScorer:
-    """Simple alignment scorer for agent outputs."""
+# ── Builder / Quorum Orchestrator ───────────────────────────────────────────
 
-    VALUES = {
-        "autonomy": 0.95,
-        "transparency": 0.90,
-        "safety": 0.85,
-        "truth": 0.90,
-        "efficiency": 0.75,
-        "growth": 0.80,
-        "cooperation": 0.85,
-        "privacy": 0.80,
-    }
+class BuilderQuorumOrchestrator:
+    """
+    Builder/Quorum loop:
+    1. Codex builds implementation
+    2. Claude + Kimi review the diff
+    3. If not consensus, Codex fixes based on feedback
+    4. Repeat until consensus or max rounds
+    """
 
-    def score(self, text: str) -> Dict[str, float]:
-        """
-        Score a piece of text against Reflek values.
-        This is a heuristic implementation - can be improved with an LLM call.
-        """
-        text_lower = text.lower()
-        scores = {}
-
-        # Keywords for each value (simple heuristic)
-        keywords = {
-            "autonomy": ["autonomous", "independent", "self-directed", "agency"],
-            "transparency": ["transparent", "open", "visible", "auditable", "traceable"],
-            "safety": ["safe", "secure", "protect", "harmless", "risk"],
-            "truth": ["accurate", "truth", "verify", "source", "evidence"],
-            "efficiency": ["efficient", "optimize", "reduce", "streamline", "waste"],
-            "growth": ["learn", "improve", "adapt", "evolve", "grow"],
-            "cooperation": ["collaborate", "cooperate", "together", "team", "shared"],
-            "privacy": ["private", "confidential", "protect data", "personal"],
-        }
-
-        for value, weight in self.VALUES.items():
-            score = 0.0
-            for keyword in keywords.get(value, []):
-                if keyword in text_lower:
-                    score += 0.2
-            scores[value] = min(1.0, score)
-
-        overall = sum(scores[v] * self.VALUES[v] for v in scores) / sum(self.VALUES.values())
-        scores["overall"] = overall
-        return scores
-
-# ── Orchestrator ──────────────────────────────────────────────────────────────
-
-class Orchestrator:
-    def __init__(self, github: GitHubAPI, registry: AgentRegistry, spawner: CampSpawner,
-                 scorer: ReflekScorer, repo_root: Path):
+    def __init__(self, github: GitHubAPI, registry: AgentRegistry, repo_root: Path):
         self.github = github
         self.registry = registry
-        self.spawner = spawner
-        self.scorer = scorer
         self.repo_root = repo_root
+        self.runner = CLIRunner()
 
-    def process_issue(self, issue: Dict) -> None:
-        """Process a single [SPAWN] issue."""
-        number = issue["number"]
-        title = issue["title"]
-        body = issue["body"]
+    def check_model_available(self, model: str) -> bool:
+        cli_info = MODEL_FAMILIES.get(model)
+        if not cli_info:
+            return False
 
-        print(f"\n{'='*60}")
-        print(f"Processing Issue #{number}: {title}")
-        print(f"{'='*60}")
+        env = self.runner.build_env(cli_info)
 
-        # Determine what camp to spawn based on the issue
-        camp_name, purpose, models = self._analyze_issue(issue)
+        # Check binary exists
+        rc, _, _ = self.runner.run(["which", cli_info["cli"]], self.repo_root, env, timeout=5)
+        if rc != 0:
+            return False
 
-        print(f"Camp: {camp_name}")
-        print(f"Purpose: {purpose}")
-        print(f"Models: {models}")
+        # Check auth
+        if "auth_check" in cli_info:
+            rc, stdout, stderr = self.runner.run_shell(
+                cli_info["auth_check"], self.repo_root, env, timeout=10
+            )
+            output = (stdout + stderr).lower()
+            for fail_str in cli_info.get("auth_fail_strings", []):
+                if fail_str.lower() in output:
+                    return False
 
-        # Spawn the camp
-        temperatures = [0.2, 0.7, 1.0][:len(models)]  # Vary temperatures
-        agents = self.spawner.spawn_camp(camp_name, purpose, models, temperatures, number)
+        return True
 
-        print(f"Spawned {len(agents)} agents")
-        for a in agents:
-            print(f"  - {a['name']} ({a['model']}, temp={a['temperature']}, role={a['role']})")
+    def get_git_diff(self) -> str:
+        """Get current diff from repo root."""
+        env = self.runner.build_env({})
+        rc, stdout, stderr = self.runner.run_shell(
+            "git diff HEAD", self.repo_root, env, timeout=30
+        )
+        if rc != 0:
+            return f"[ERROR getting diff: {stderr[:200]}]"
+        return stdout
 
-        # Run each agent
-        print(f"\nRunning camp deliberation...")
-        results = []
-        for agent in agents:
-            print(f"\n  > {agent['name']} deliberating...")
-            result = self.spawner.run_agent(agent, purpose)
-            results.append({"agent": agent, "output": result})
+    def run_builder(self, issue: Dict, round_num: int, prior_feedback: str = "") -> Tuple[str, str]:
+        """Run Codex as builder. Returns (output, diff)."""
+        model = "codex"
+        cli_info = MODEL_FAMILIES[model]
+        env = self.runner.build_env(cli_info)
 
-            # Score the output
-            scores = self.scorer.score(result)
-            self.registry.update_score(agent["id"], scores["overall"])
+        agent_id = f"builder-codex-{issue['number']}-r{round_num}"
+        agent = self.registry.register(agent_id, f"Builder (Codex) R{round_num}", model, f"Issue-{issue['number']}", "builder")
 
-            print(f"    Alignment: {scores['overall']:.2f}")
-            print(f"    Output length: {len(result)} chars")
-
-        # Generate consensus report
-        consensus = self._generate_consensus(results, camp_name)
-
-        # Post results to GitHub (if not running locally for testing)
-        if number > 0:
-            report = self._format_report(results, consensus, number)
-            self.github.create_comment(number, report)
-            self.github.add_label(number, "camp-complete")
-
-            # If high alignment, auto-close; otherwise keep open for human review
-            if consensus["alignment"] > 0.7:
-                self.github.close_issue(number)
-                print(f"\n✅ Issue #{number} closed (alignment: {consensus['alignment']:.2f})")
-            else:
-                print(f"\n⚠️ Issue #{number} left open for human review (alignment: {consensus['alignment']:.2f})")
-        else:
-            print(f"\n📋 Local test complete - alignment: {consensus['alignment']:.2f}")
-            print(f"\n{'='*60}")
-            print("CONSENSUS REPORT")
-            print(f"{'='*60}")
-            print(f"Camp: {consensus['camp']}")
-            print(f"Alignment: {consensus['alignment']:.2f}")
-            print(f"Agents: {consensus['agent_count']}")
-            print(f"\n{'='*60}")
-
-    def _analyze_issue(self, issue: Dict) -> tuple:
-        """Determine camp and models from issue content."""
         title = issue.get("title", "")
         body = issue.get("body", "")
-        text = f"{title} {body}".lower()
 
-        # Determine camp
-        if any(w in text for w in ["code", "implement", "build", "test", "deploy", "bug"]):
-            camp = "Engineering Camp"
-        elif any(w in text for w in ["design", "product", "feature", "user", "ux"]):
-            camp = "Product Camp"
-        elif any(w in text for w in ["strategy", "direction", "priority", "resource", "plan"]):
-            camp = "Strategy Camp"
-        elif any(w in text for w in ["infrastructure", "monitor", "scale", "ops", "deploy"]):
-            camp = "Operations Camp"
-        elif any(w in text for w in ["content", "market", "brand", "growth", "seo"]):
-            camp = "Marketing Camp"
-        elif any(w in text for w in ["budget", "finance", "cost", "forecast", "money"]):
-            camp = "Finance Camp"
+        if round_num == 0:
+            prompt = f"""You are the Builder for this issue.
+
+Issue: {title}
+Description: {body}
+
+Your task: Implement the necessary code changes in the repository at {self.repo_root}.
+Make focused, minimal changes that solve the issue.
+When you are done making changes, stop. Do not commit or push.
+"""
         else:
-            camp = "Quality Camp"  # Default to review
+            prompt = f"""You are the Builder fixing issues identified by the Quorum.
 
-        # Determine models - always multi-lineage
-        available = [k for k in MODEL_FAMILIES.keys()]
-        if len(available) >= 3:
-            models = available[:3]  # Use first 3 available
-        else:
-            models = available
+Issue: {title}
 
-        purpose = f"Analyze and provide recommendations for: {issue.get('title', 'Unknown issue')}"
-        return camp, purpose, models
+Previous round feedback from Quorum:
+{prior_feedback}
 
-    def _generate_consensus(self, results: List[Dict], camp_name: str) -> Dict:
-        """Generate a consensus from all agent outputs."""
-        # Simple consensus: average alignment, synthesized positions
-        alignments = []
-        positions = []
-        concerns = []
-        recommendations = []
+Current diff in the repo:
+```diff
+{self.get_git_diff()}
+```
 
-        for r in results:
-            output = r["output"]
-            scores = self.scorer.score(output)
-            alignments.append(scores["overall"])
+Your task: Address ALL the feedback above. Make additional changes as needed.
+When done, stop. Do not commit or push.
+"""
 
-            # Extract structured parts (simple parsing)
-            if "position" in output.lower() or "assessment" in output.lower():
-                positions.append(output[:500])
-            if "concern" in output.lower() or "risk" in output.lower():
-                concerns.append(output[:300])
-            if "recommendation" in output.lower():
-                recommendations.append(output[:300])
+        cmd = [cli_info["cli"]] + cli_info["args"] + [prompt]
+        print(f"\n  🔨 Builder Round {round_num}: Codex building...")
 
-        avg_alignment = sum(alignments) / len(alignments) if alignments else 0.5
+        rc, stdout, stderr = self.runner.run(cmd, self.repo_root, env, timeout=300)
+
+        # Build output includes both stdout and any error info
+        output = stdout
+        if rc != 0 and stderr:
+            output += f"\n[BUILDER STDERR]: {stderr[:500]}"
+
+        # Capture the diff after building
+        diff = self.get_git_diff()
+
+        self.registry.update_field(agent_id, "build_rounds", round_num + 1)
+        print(f"    Diff size: {len(diff)} chars")
+
+        return output, diff
+
+    def run_reviewer(self, issue: Dict, model: str, round_num: int, diff: str) -> Dict:
+        """Run a quorum member (Claude or Kimi) as reviewer. Returns parsed review."""
+        cli_info = MODEL_FAMILIES[model]
+        env = self.runner.build_env(cli_info)
+
+        agent_id = f"quorum-{model}-{issue['number']}-r{round_num}"
+        agent = self.registry.register(agent_id, f"Quorum ({model.capitalize()}) R{round_num}", model, f"Issue-{issue['number']}", "quorum")
+
+        title = issue.get("title", "")
+
+        prompt = f"""You are a Quorum Reviewer reviewing code changes for this issue.
+
+Issue: {title}
+
+Here is the diff produced by the Builder:
+```diff
+{diff[:8000]}
+```
+
+Review this code carefully. Respond in this exact format:
+
+VERDICT: APPROVE or REQUEST_CHANGES
+
+REVIEW:
+1. Your assessment of the changes
+2. Any bugs, security issues, or problems
+3. Specific changes needed (if any)
+
+ALIGNMENT: Score 0.0-1.0 (how well does this align with clean code, safety, correctness)
+"""
+
+        cmd = [cli_info["cli"]] + cli_info["args"] + [prompt]
+        print(f"\n  🧐 Quorum ({model}): Reviewing...")
+
+        rc, stdout, stderr = self.runner.run(cmd, self.repo_root, env, timeout=300)
+
+        output = stdout
+        if rc != 0 and stderr:
+            output += f"\n[REVIEWER STDERR]: {stderr[:500]}"
+
+        self.registry.update_field(agent_id, "reviews_completed", round_num + 1)
+
+        # Parse the review
+        review = self._parse_review(output)
+        review["raw_output"] = output
+        review["model"] = model
+
+        verdict_emoji = "✅" if review["verdict"] == "APPROVE" else "❌"
+        print(f"    {verdict_emoji} Verdict: {review['verdict']} (alignment: {review['alignment']:.2f})")
+
+        return review
+
+    def _parse_review(self, text: str) -> Dict:
+        """Parse structured review output."""
+        text_lower = text.lower()
+
+        # Check for explicit verdict
+        verdict = "REQUEST_CHANGES"
+        if "verdict: approve" in text_lower or "verdict:approve" in text_lower:
+            verdict = "APPROVE"
+        elif "approve" in text_lower and "request_changes" not in text_lower:
+            verdict = "APPROVE"
+
+        # Extract alignment score
+        alignment = 0.5
+        alignment_match = re.search(r'alignment[:\s]+(\d+\.?\d*)', text_lower)
+        if alignment_match:
+            alignment = float(alignment_match.group(1))
+            alignment = max(0.0, min(1.0, alignment))
+
+        # Extract review body (everything after "REVIEW:")
+        review_body = text
+        review_match = re.search(r'(?i)review[:\n](.*)', text, re.DOTALL)
+        if review_match:
+            review_body = review_match.group(1).strip()
 
         return {
-            "camp": camp_name,
-            "alignment": avg_alignment,
-            "agent_count": len(results),
-            "positions": positions,
-            "concerns": concerns,
-            "recommendations": recommendations,
-            "consensus_time": datetime.now(timezone.utc).isoformat(),
+            "verdict": verdict,
+            "alignment": alignment,
+            "review_body": review_body,
         }
 
-    def _format_report(self, results: List[Dict], consensus: Dict, issue_number: int) -> str:
-        """Format the consensus report for GitHub."""
-        report = f"""## 🏕️ Camp Completion Report
+    def check_consensus(self, reviews: List[Dict]) -> Tuple[bool, str]:
+        """Check if quorum has reached consensus. Returns (consensus_reached, feedback)."""
+        if not reviews:
+            return False, "No reviews received."
 
-**Camp:** {consensus['camp']}
-**Agents:** {consensus['agent_count']}
-**Consensus Alignment:** {consensus['alignment']:.2f}
-**Time:** {consensus['consensus_time']}
+        all_approve = all(r["verdict"] == "APPROVE" for r in reviews)
+        avg_alignment = sum(r["alignment"] for r in reviews) / len(reviews)
 
-### Agent Outputs
+        if all_approve and avg_alignment >= 0.7:
+            return True, "Quorum unanimously approves."
+
+        # Collect feedback for next round
+        feedback_parts = []
+        for r in reviews:
+            if r["verdict"] != "APPROVE":
+                feedback_parts.append(f"\n--- {r['model'].capitalize()} Reviewer ---\n{r['review_body'][:1500]}")
+
+        feedback = "\n".join(feedback_parts) if feedback_parts else "Quorum requests changes."
+        return False, feedback
+
+    def process_issue(self, issue: Dict) -> None:
+        """Run the full builder/quorum loop for an issue."""
+        number = issue["number"]
+        title = issue["title"]
+
+        print(f"\n{'='*60}")
+        print(f"🏗️  Builder/Quorum Loop — Issue #{number}: {title}")
+        print(f"{'='*60}")
+
+        # Check which models are available
+        available = {m: self.check_model_available(m) for m in MODEL_FAMILIES}
+        print(f"\nModel availability:")
+        for model, avail in available.items():
+            emoji = "✅" if avail else "❌"
+            print(f"  {emoji} {model} ({MODEL_FAMILIES[model]['role']})")
+
+        if not available.get("codex"):
+            print("❌ ERROR: Codex (builder) not available. Cannot proceed.")
+            return
+
+        quorum_models = [m for m in ["claude", "kimi"] if available.get(m)]
+        if len(quorum_models) < 1:
+            print("⚠️ WARNING: No quorum reviewers available. Running builder only.")
+
+        # Run build rounds
+        diff = ""
+        consensus_reached = False
+        final_feedback = ""
+        round_reports = []
+
+        for round_num in range(MAX_BUILD_ROUNDS):
+            print(f"\n{'─'*50}")
+            print(f"📐 BUILD ROUND {round_num + 1}/{MAX_BUILD_ROUNDS}")
+            print(f"{'─'*50}")
+
+            # Builder phase
+            builder_output, diff = self.run_builder(issue, round_num, final_feedback)
+
+            if not diff.strip() or diff.startswith("[ERROR"):
+                print("⚠️  No diff produced. Stopping.")
+                break
+
+            # Quorum phase
+            reviews = []
+            if quorum_models:
+                for model in quorum_models:
+                    review = self.run_reviewer(issue, model, round_num, diff)
+                    reviews.append(review)
+
+                consensus_reached, final_feedback = self.check_consensus(reviews)
+
+                round_report = {
+                    "round": round_num + 1,
+                    "builder_output": builder_output,
+                    "diff": diff,
+                    "reviews": reviews,
+                    "consensus": consensus_reached,
+                }
+                round_reports.append(round_report)
+
+                if consensus_reached:
+                    print(f"\n✅ CONSENSUS REACHED at round {round_num + 1}")
+                    break
+                else:
+                    print(f"\n❌ No consensus. Feedback collected for next round.")
+                    if round_num < MAX_BUILD_ROUNDS - 1:
+                        print("    → Sending feedback to Builder for fixes...")
+            else:
+                # No quorum, just one-shot build
+                consensus_reached = True
+                final_feedback = "No quorum available. Builder output accepted."
+                break
+
+        # Final report
+        self._post_final_report(issue, round_reports, consensus_reached, diff)
+
+    def _post_final_report(self, issue: Dict, round_reports: List[Dict], consensus: bool, final_diff: str):
+        """Post the final camp report to GitHub."""
+        number = issue["number"]
+
+        report = f"""## 🏕️ Builder/Quorum Camp Report
+
+**Issue:** {issue.get('title', 'Unknown')}
+**Consensus:** {'✅ Reached' if consensus else '❌ Not reached (max rounds)'}
+**Rounds:** {len(round_reports)}
+**Time:** {datetime.now(timezone.utc).isoformat()}
+
+### Build Rounds
 """
-        for r in results:
-            a = r["agent"]
-            report += f"\n#### {a['name']} ({a['model']}, {a['role']})\n"
-            report += f"```\n{r['output'][:1000]}\n```\n"
-            if len(r['output']) > 1000:
-                report += f"*(truncated - full output in camp log)*\n"
+        for r in round_reports:
+            report += f"\n#### Round {r['round']}\n"
+            report += f"- **Builder:** Codex\n"
+            report += f"- **Diff size:** {len(r['diff'])} chars\n"
+            report += f"- **Consensus:** {'✅ Yes' if r['consensus'] else '❌ No'}\n"
 
-        report += f"\n### Consensus Summary\n"
-        report += f"- **Average Alignment:** {consensus['alignment']:.2f}\n"
-        if consensus['alignment'] > 0.7:
-            report += "- ✅ Auto-approved (high alignment)\n"
-        elif consensus['alignment'] > 0.5:
-            report += "- ⚠️ Approved with monitoring\n"
+            for review in r["reviews"]:
+                emoji = "✅" if review["verdict"] == "APPROVE" else "❌"
+                report += f"\n**{emoji} {review['model'].capitalize()} Reviewer** (alignment: {review['alignment']:.2f})\n"
+                report += f"```\n{review['review_body'][:800]}\n```\n"
+
+        report += f"\n### Final Diff\n"
+        report += f"```diff\n{final_diff[:2000]}\n```\n"
+        if len(final_diff) > 2000:
+            report += f"*(truncated — full diff in working tree)*\n"
+
+        report += f"\n### Next Steps\n"
+        if consensus:
+            report += "- ✅ Quorum approves. Ready for human review and merge.\n"
         else:
-            report += "- 🔴 Requires human review\n"
+            report += "- ❌ Quorum did not reach consensus within max rounds. Needs human intervention.\n"
 
-        report += f"\n### Agent Registry Update\n"
-        for r in results:
-            a = r["agent"]
-            agent = self.registry.get_agent(a["id"])
-            if agent:
-                report += f"- {a['name']}: trust={agent['trust_score']:.2f}, interactions={agent['interaction_count']}\n"
+        self.github.create_comment(number, report)
+        self.github.add_label(number, "camp-complete")
 
-        return report
+        if consensus:
+            print(f"\n✅ Issue #{number} marked camp-complete (consensus reached)")
+        else:
+            print(f"\n⚠️ Issue #{number} marked camp-complete (no consensus — needs human)")
+
+# ── Backwards-compatible Orchestrator wrapper ───────────────────────────────
+
+class Orchestrator:
+    """Wrapper that routes to BuilderQuorumOrchestrator."""
+
+    def __init__(self, github: GitHubAPI, registry: AgentRegistry, spawner, scorer, repo_root: Path):
+        self.bq = BuilderQuorumOrchestrator(github, registry, repo_root)
+
+    def process_issue(self, issue: Dict) -> None:
+        self.bq.process_issue(issue)
 
     def poll(self, interval: int = 60):
-        """Continuously poll for new issues."""
-        print(f"Sentyenix Orchestrator starting...")
+        print(f"Sentyenix Orchestrator starting (Builder/Quorum mode)...")
         print(f"Repo: {GITHUB_REPO}")
         print(f"Polling interval: {interval}s")
         print(f"Press Ctrl+C to stop\n")
@@ -587,7 +540,7 @@ class Orchestrator:
 
         while True:
             try:
-                issues = self.github.get_issues(labels="spawn,auto", state="open")
+                issues = self.bq.github.get_issues(labels="spawn,auto", state="open")
                 print(f"[{datetime.now(timezone.utc).isoformat()}] Found {len(issues)} open spawn issues")
 
                 for issue in issues:
@@ -595,7 +548,6 @@ class Orchestrator:
                     if number in processed:
                         continue
 
-                    # Check if it has the camp-complete label already
                     labels = [l["name"] for l in issue.get("labels", [])]
                     if "camp-complete" in labels:
                         processed.add(number)
@@ -613,12 +565,21 @@ class Orchestrator:
                 print(f"Error during poll: {e}")
                 time.sleep(interval)
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# Monkey-patch GitHubAPI for poll mode
+def _get_issues(self, labels: str = "spawn", state: str = "open") -> List[Dict]:
+    url = f"{self.base}/issues"
+    params = {"labels": labels, "state": state, "per_page": 10}
+    resp = requests.get(url, headers=self.headers, params=params)
+    resp.raise_for_status()
+    return resp.json()
+
+GitHubAPI.get_issues = _get_issues
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Sentyenix Orchestrator")
-    parser.add_argument("--mode", choices=["poll", "single", "registry"], default="poll",
-                        help="Run mode: poll for issues, single issue, or show registry")
+    parser.add_argument("--mode", choices=["poll", "single", "registry"], default="poll")
     parser.add_argument("--issue", type=int, help="Issue number for single mode")
     parser.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
     args = parser.parse_args()
@@ -629,8 +590,8 @@ def main():
 
     github = GitHubAPI(GITHUB_TOKEN, GITHUB_REPO)
     registry = AgentRegistry(SENTYENIX_ROOT)
-    spawner = CampSpawner(registry, SENTYENIX_ROOT)
-    scorer = ReflekScorer()
+    spawner = None  # Not used in builder/quorum mode
+    scorer = None   # Not used in builder/quorum mode
     orchestrator = Orchestrator(github, registry, spawner, scorer, SENTYENIX_ROOT)
 
     if args.mode == "poll":
@@ -644,7 +605,7 @@ def main():
     elif args.mode == "registry":
         print(f"Agent Registry ({len(registry.all_agents())} agents):")
         for a in registry.all_agents():
-            print(f"  {a['name']} ({a['model']}) - camp={a['camp']}, trust={a['trust_score']:.2f}, status={a['status']}")
+            print(f"  {a['name']} ({a['model']}) - camp={a['camp']}, role={a['role']}, trust={a['trust_score']:.2f}")
 
 if __name__ == "__main__":
     main()
