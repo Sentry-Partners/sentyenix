@@ -22,8 +22,8 @@ jobs:
       - name: Detect and route
         id: detect
         run: |
-          echo "changed_files=$(git diff --name-only HEAD~1 HEAD | tr '\n' ',')" >> $GITHUB_OUTPUT
-          echo "commit_message=$(git log -1 --pretty=format:'%s')" >> $GITHUB_OUTPUT
+          echo "changed_files=${{ join(github.event.head_commit.modified, ',') }}" >> $GITHUB_OUTPUT
+          echo "commit_message=${{ github.event.head_commit.message }}" >> $GITHUB_OUTPUT
           
       - name: Create issue for push
         if: github.event_name == 'push'
@@ -31,11 +31,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ISSUE_NUM=$(gh issue create --title "[SPAWN] Push: ${{ github.event.head_commit.message }}" --body "Auto-generated camp activation for push to main." --label "spawn,auto" | grep -oE '#[0-9]+' | tr -d '#')
+          ISSUE_NUM=$(gh issue create --title "[SPAWN] Push: ${{ github.event.head_commit.message }}" --body "Auto-generated camp activation for push to main." | grep -oE '#[0-9]+' | tr -d '#')
           echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
           
       - name: Run orchestrator for push
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && steps.create_issue.outputs.issue_number != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
