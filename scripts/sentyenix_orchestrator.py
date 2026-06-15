@@ -47,8 +47,14 @@ MODEL_FAMILIES = {
         "auth_fail_strings": ["auth", "login", "API key", "not authenticated"],
     },
     # Grok and Kimi can be added when their CLIs are available
+    "kimi": {
+        "cli": "kimi",
+        "args": ["-p", "--yolo"],
+        "path": "/Users/carlos/.kimi-code/bin",
+        "auth_check": "export PATH='/Users/carlos/.kimi-code/bin:$PATH' && kimi -p 'hi' 2>&1 | head -1",
+        "auth_fail_strings": ["not authenticated", "login", "unauthorized", "auth"],
+    },
     # "grok": ...
-    # "kimi": ...
     # "gemma": {"cli": "ollama", "args": ["run", "gemma4:31b"]}
 }
 
@@ -198,6 +204,11 @@ class CampSpawner:
         if not cli_info:
             return False
         
+        # Build env with optional custom PATH
+        env = {**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
+        if "path" in cli_info:
+            env["PATH"] = f"{cli_info['path']}:{env.get('PATH', '')}"
+        
         # Check if CLI binary exists
         try:
             result = subprocess.run(
@@ -205,6 +216,7 @@ class CampSpawner:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=env,
             )
             if result.returncode != 0:
                 return False
@@ -221,7 +233,7 @@ class CampSpawner:
                     text=True,
                     timeout=10,
                     cwd=str(self.repo_root),
-                    env={**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
+                    env=env,
                 )
                 output = (result.stdout + result.stderr).lower()
                 for fail_str in cli_info.get("auth_fail_strings", []):
@@ -314,6 +326,12 @@ Respond with a structured analysis including:
 
         # Use the CLI
         cmd = [cli] + args + [full_prompt]
+        
+        # Build env with optional custom PATH
+        env = {**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
+        if "path" in cli_info:
+            env["PATH"] = f"{cli_info['path']}:{env.get('PATH', '')}"
+        
         try:
             result = subprocess.run(
                 cmd,
@@ -321,7 +339,7 @@ Respond with a structured analysis including:
                 text=True,
                 timeout=timeout,
                 cwd=str(self.repo_root),
-                env={**os.environ, "HOME": os.environ.get("HOME", str(Path.home()))}
+                env=env,
             )
             if result.returncode != 0:
                 err = result.stderr[:500]
