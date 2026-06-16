@@ -121,6 +121,7 @@ Automated actions triggered by state changes:
 on_issue_created:
   - reflek: Calculate alignment score
   - geno: Verify genetic signature
+  - geno: Create or update project memory record
   - graphik: Create node in knowledge graph
   - notify: Alert relevant camps
 
@@ -132,6 +133,7 @@ on_pr_submitted:
 
 on_pr_merged:
   - geno: Inoculate new nodes
+  - geno: Record completed project outcome
   - graphik: Update ontology
   - rekall: Index new knowledge
   - notify: Alert all camps of change
@@ -147,6 +149,29 @@ on_emergency_declared:
   - geno: Begin quarantine protocol
   - supervising: Convene within 1 hour
 ```
+
+## Geno Project Memory Protocol
+
+Geno is the durable record keeper for project state. GitHub remains the transport for issues, comments, labels, and Actions, while Geno owns the project memory that PMs, engineers, executives, and agents read later.
+
+```yaml
+geno_project_memory:
+  identity:
+    source: github_issue
+    project_id: github-issue-{number}
+  events:
+    - camp_started
+    - round_reviewed
+    - camp_completed
+    - camp_aborted
+  guarantees:
+    - append_only_history
+    - source_issue_linkage
+    - machine_readable_status
+    - no_registry_runtime_churn
+```
+
+Agent registry records identify who can act. Geno project-memory records describe what happened to a project.
 
 ---
 

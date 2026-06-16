@@ -127,6 +127,19 @@ class AgentRegistry:
         self.registry_file.write_text(json.dumps(self.agents, indent=2))
 
     def register(self, agent_id: str, name: str, model: str, camp: str, role: str) -> Dict:
+        existing = self.get(agent_id)
+        if existing:
+            existing.update({
+                "name": name,
+                "model": model,
+                "camp": camp,
+                "role": role,
+                "status": "active",
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._save()
+            return existing
+
         agent = {
             "id": agent_id,
             "name": name,
@@ -140,6 +153,53 @@ class AgentRegistry:
         self.agents["agents"].append(agent)
         self._save()
         return agent
+
+    def get(self, agent_id: str) -> Optional[Dict]:
+        for agent in self.agents.get("agents", []):
+            if agent.get("id") == agent_id:
+                return agent
+        return None
+
+# ── Geno Project Memory ─────────────────────────────────────────────────────
+
+class GenoProjectMemory:
+    """Append-only project memory adapter for Sentyenix orchestration events."""
+
+    def __init__(self, root: Path):
+        self.memory_dir = root / ".geno"
+        self.memory_file = self.memory_dir / "project-memory.jsonl"
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+    def record(self, event_type: str, issue: Dict, payload: Optional[Dict] = None) -> Dict:
+        record = {
+            "schema_version": "geno.project_memory.v1",
+            "event_type": event_type,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "project": {
+                "id": f"github-issue-{issue['number']}",
+                "source": "github_issue",
+                "number": issue["number"],
+                "title": issue.get("title", ""),
+                "url": issue.get("html_url", ""),
+            },
+            "payload": payload or {},
+        }
+        with self.memory_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        return record
+
+    def read_project(self, issue_number: int) -> List[Dict]:
+        if not self.memory_file.exists():
+            return []
+        project_id = f"github-issue-{issue_number}"
+        records = []
+        for line in self.memory_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("project", {}).get("id") == project_id:
+                records.append(record)
+        return records
 
 # ── CLI Runner ──────────────────────────────────────────────────────────────
 
@@ -314,10 +374,11 @@ class CampProgressReporter:
             pass
 
 class MATOrchestrator:
-    def __init__(self, github: GitHubAPI, registry: AgentRegistry, repo_root: Path):
+    def __init__(self, github: GitHubAPI, registry: AgentRegistry, repo_root: Path, geno_memory: GenoProjectMemory):
         self.github = github
         self.registry = registry
         self.repo_root = repo_root
+        self.geno_memory = geno_memory
         self.runner = CLIRunner()
         self.tracker = ConvergenceTracker()
         self.progress = None  # type: CampProgressReporter | None
@@ -478,6 +539,7 @@ SCOPE_REVIEW:
         # Initialize progress reporter
         self.progress = CampProgressReporter(self.repo_root, number)
         self.progress.update("running", "Camp initializing", "Checking model availability")
+        self.geno_memory.record("camp_started", issue, {"status": "running"})
 
         # Post "camp started" comment so user can watch live
         self.github.create_comment(
@@ -495,6 +557,7 @@ SCOPE_REVIEW:
         if not available.get("codex"):
             print("❌ No builder available")
             self.progress.update("error", "No builder available", "Codex CLI not found or not authenticated")
+            self.geno_memory.record("camp_aborted", issue, {"reason": "Codex builder not available"})
             self.github.create_comment(number, "❌ **Camp aborted:** Codex builder not available.")
             return
 
@@ -550,6 +613,21 @@ SCOPE_REVIEW:
                     "status": status,
                     "reason": reason,
                 })
+                self.geno_memory.record("round_reviewed", issue, {
+                    "round": round_num + 1,
+                    "status": status,
+                    "reason": reason,
+                    "diff_chars": len(diff),
+                    "reviews": [
+                        {
+                            "model": r.get("model"),
+                            "verdict": r.get("verdict"),
+                            "scope": r.get("scope"),
+                            "alignment": r.get("alignment"),
+                        }
+                        for r in reviews
+                    ],
+                })
 
                 self.progress.update("assessing", f"Round {round_num + 1}", f"Status: {status} — {reason}")
                 print(f"\n  📊 Camp Status: {status} — {reason}")
@@ -585,6 +663,13 @@ SCOPE_REVIEW:
                         print("    📐 Scope extended (legitimate drift approved by quorum)")
             else:
                 round_reports.append({"round": 1, "diff": diff, "reviews": [], "status": "NO_QUORUM", "reason": "No quorum available"})
+                self.geno_memory.record("round_reviewed", issue, {
+                    "round": 1,
+                    "status": "NO_QUORUM",
+                    "reason": "No quorum available",
+                    "diff_chars": len(diff),
+                    "reviews": [],
+                })
                 break
 
             round_num += 1
@@ -657,6 +742,11 @@ SCOPE_REVIEW:
         self.github.add_label(number, "camp-complete")
         if self.progress:
             self.progress.done(status, len(round_reports))
+        self.geno_memory.record("camp_completed", issue, {
+            "status": status,
+            "rounds": len(round_reports),
+            "reason": final.get("reason", ""),
+        })
         print(f"\n📋 Report posted to Issue #{number}")
 
     def poll(self, interval: int = 60):
@@ -704,7 +794,8 @@ def main():
 
     github = GitHubAPI(GITHUB_TOKEN, GITHUB_REPO)
     registry = AgentRegistry(SENTYENIX_ROOT)
-    orchestrator = MATOrchestrator(github, registry, SENTYENIX_ROOT)
+    geno_memory = GenoProjectMemory(SENTYENIX_ROOT)
+    orchestrator = MATOrchestrator(github, registry, SENTYENIX_ROOT, geno_memory)
 
     if args.mode == "poll":
         orchestrator.poll(args.interval)
